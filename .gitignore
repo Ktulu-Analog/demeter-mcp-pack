@@ -1,0 +1,4 @@
+/dist/
+/mcp-servers/*/bin/*
+!/mcp-servers/*/bin/.gitkeep
+/sources/*/target/

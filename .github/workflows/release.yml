@@ -1,0 +1,94 @@
+name: Build & Release MCP pack
+
+# Déclenché sur un tag "vX.Y.Z" — le tag fait foi pour la version publiée.
+# Peut aussi être lancé manuellement pour tester la matrice sans publier.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write   # requis pour que softprops/action-gh-release publie la release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform_key: linux-x64
+            target: x86_64-unknown-linux-gnu
+          - os: macos-13          # runner Intel
+            platform_key: macos-x64
+            target: x86_64-apple-darwin
+          - os: macos-14          # runner Apple Silicon
+            platform_key: macos-arm64
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            platform_key: windows-x64
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (${{ matrix.platform_key }})
+        shell: bash
+        run: scripts/build-all.sh "${{ matrix.platform_key }}" "${{ matrix.target }}"
+
+      - name: Upload binaires (${{ matrix.platform_key }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.platform_key }}
+          path: mcp-servers/*/bin/*
+          if-no-files-found: error
+
+  package-and-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Récupérer tous les binaires compilés
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: /tmp/artifacts
+
+      - name: Ranger les binaires dans mcp-servers/*/bin/
+        run: |
+          set -euo pipefail
+          for platform_dir in /tmp/artifacts/bin-*; do
+            find "$platform_dir" -type f | while read -r f; do
+              server_name="$(basename "$(dirname "$(dirname "$f")")")"
+              mkdir -p "mcp-servers/$server_name/bin"
+              cp "$f" "mcp-servers/$server_name/bin/"
+            done
+          done
+          find mcp-servers -name "*.exe" -o -type f -path "*/bin/mcp-*" | xargs -r chmod +x || true
+
+      - name: Aligner VERSION sur le tag
+        run: echo "${GITHUB_REF_NAME#v}" > VERSION
+
+      - name: Assembler les archives de release
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh
+
+      - name: Publier la release GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true

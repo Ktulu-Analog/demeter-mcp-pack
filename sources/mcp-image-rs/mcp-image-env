@@ -1,0 +1,65 @@
+# ============================================================================
+# mcp-image — Configuration
+# Copiez ce fichier en .env et adaptez les valeurs à votre setup.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# ComfyUI
+# ----------------------------------------------------------------------------
+
+# URL du serveur ComfyUI
+COMFYUI_URL=http://127.0.0.1:8188
+
+# Modèle .safetensors à utiliser par défaut
+# (doit être présent dans ComfyUI/models/checkpoints/)
+DEFAULT_MODEL=v1-5-pruned-emaonly.safetensors
+
+# ----------------------------------------------------------------------------
+# Paramètres de génération par défaut
+# (tous overridables à chaque appel de generate_image)
+# ----------------------------------------------------------------------------
+
+# Prompt négatif appliqué si l'appelant n'en fournit pas
+DEFAULT_NEGATIVE=ugly, blurry, low quality, watermark
+
+# Dimensions de l'image (doivent être des multiples de 64)
+DEFAULT_WIDTH=512
+DEFAULT_HEIGHT=512
+
+# Nombre d'étapes de débruitage
+DEFAULT_STEPS=20
+
+# Guidance scale (adhérence au prompt ; 7 = bon équilibre)
+DEFAULT_CFG=7.0
+
+# Sampler KSampler (euler, dpm_2, dpm_pp_2m, ddim…)
+DEFAULT_SAMPLER=euler
+
+# Scheduler (normal, karras, exponential…)
+DEFAULT_SCHEDULER=normal
+
+# ----------------------------------------------------------------------------
+# Serveur MCP
+# ----------------------------------------------------------------------------
+
+# Adresse d'écoute
+MCP_HOST=0.0.0.0
+
+# Port d'écoute
+MCP_PORT=6510
+
+# Chemin de l'endpoint MCP
+MCP_PATH=/mcp
+
+# ----------------------------------------------------------------------------
+# HTTP
+# ----------------------------------------------------------------------------
+
+# Timeout des requêtes vers ComfyUI (secondes)
+# À augmenter si vos générations sont longues (SDXL, LoRA lourds…)
+HTTP_TIMEOUT_SECS=120
+
+# ----------------------------------------------------------------------------
+# Logs (format tracing-subscriber)
+# RUST_LOG=mcp_image=debug,tower_http=info
+# ----------------------------------------------------------------------------
