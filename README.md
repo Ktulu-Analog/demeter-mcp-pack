@@ -113,7 +113,7 @@ demeter-mcp-pack/
 ├── scripts/
 │   ├── build-all.sh              ← compile les 5 serveurs pour UNE plateforme
 │   └── package.sh                ← assemble les archives de release + checksums
-├── .github/workflows/release.yml ← CI : matrice 4 plateformes → GitHub Release
+├── .github/workflows/release.yml ← CI : matrice 2 plateformes → GitHub Release
 └── VERSION                       ← version courante du pack (semver)
 ```
 
@@ -141,7 +141,7 @@ Les archives et `checksums.txt` sont générées dans `dist/`.
 1. On modifie directement le code d'un serveur dans son dossier (`sources/mcp-grist-rs/`…).
 2. On incrémente `VERSION` à la racine (semver).
 3. On pousse un tag `vX.Y.Z` → la CI (`.github/workflows/release.yml`) :
-   - compile les 5 serveurs pour les 4 plateformes (`linux-x64`, `macos-x64`, `macos-arm64`, `windows-x64`) ;
+   - compile les 5 serveurs pour les 2 plateformes couvertes par la CI (`linux-x64`, `windows-x64` — le build macOS reste possible en local via `scripts/build-all.sh`, voir ci-dessus) ;
    - assemble un pack combiné (`mcp-pack-X.Y.Z.zip`) **et** une archive par serveur (`mcp-grist-X.Y.Z.zip`…) — utile pour un usage hors Demeter, par exemple dans Claude Desktop ;
    - publie le tout, avec un `checksums.txt` (SHA-256), en [GitHub Release](../../releases).
 

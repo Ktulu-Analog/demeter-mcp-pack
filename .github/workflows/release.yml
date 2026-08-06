@@ -23,12 +23,6 @@ jobs:
           - os: ubuntu-latest
             platform_key: linux-x64
             target: x86_64-unknown-linux-gnu
-          - os: macos-13          # runner Intel
-            platform_key: macos-x64
-            target: x86_64-apple-darwin
-          - os: macos-14          # runner Apple Silicon
-            platform_key: macos-arm64
-            target: aarch64-apple-darwin
           - os: windows-latest
             platform_key: windows-x64
             target: x86_64-pc-windows-msvc
