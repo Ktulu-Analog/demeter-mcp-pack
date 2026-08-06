@@ -1978,8 +1978,12 @@ fn do_disk_usage(args: &Value) -> Result<String> {
             if ret == 0 {
                 let s = unsafe { stat.assume_init() };
                 let block = s.f_frsize as u64;
-                let total  = s.f_blocks * block;
-                let free   = s.f_bavail * block;
+                // f_blocks/f_bavail sont u64 sous Linux mais u32 sous macOS
+                // (libc::statvfs) — cast explicite nécessaire pour compiler
+                // sur les deux plateformes (sans effet sur Linux, où le cast
+                // u64→u64 est un no-op).
+                let total  = s.f_blocks as u64 * block;
+                let free   = s.f_bavail as u64 * block;
                 let used   = total - free;
                 Some(json!({
                     "total":     format_size(total),
