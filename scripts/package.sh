@@ -43,7 +43,7 @@ done
 # Checksums
 (
   cd "$DIST"
-  sha256sum ./*.zip > checksums.txt 2>/dev/null || shasum -a 256 ./*.zip > checksums.txt
+  sha256sum -- *.zip > checksums.txt 2>/dev/null || shasum -a 256 -- *.zip > checksums.txt
 )
 
 echo ""
