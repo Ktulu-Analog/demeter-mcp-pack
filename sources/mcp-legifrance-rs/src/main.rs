@@ -18,7 +18,7 @@ mod tools;
 
 use axum::{
     extract::State,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -26,7 +26,7 @@ use axum::{
 use clap::{Parser, ValueEnum};
 use mcp::{
     Capabilities, InitializeResult, JsonRpcRequest, JsonRpcResponse,
-    ServerInfo, ToolsCapability, ToolsListResult,
+    ServerInfo, ToolsCapability,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -60,8 +60,10 @@ struct Args {
     /// Transport à utiliser
     #[arg(long, value_enum, default_value_t = Transport::Http, env = "MCP_TRANSPORT")]
     transport: Transport,
-    /// Adresse d'écoute (mode http uniquement)
-    #[arg(long, default_value = "0.0.0.0", env = "MCP_HOST")]
+    /// Adresse d'écoute (mode http uniquement). 127.0.0.1 par défaut : le serveur
+    /// n'a pas d'authentification et consomme VOTRE quota PISTE ; ne l'exposez
+    /// sur 0.0.0.0 (MCP_HOST) que derrière un proxy authentifié.
+    #[arg(long, default_value = "127.0.0.1", env = "MCP_HOST")]
     host: String,
     /// Port d'écoute (mode http uniquement)
     #[arg(long, default_value_t = 6503, env = "MCP_PORT")]
@@ -250,16 +252,32 @@ async fn write_stdio_line(
 // Handlers
 // ---------------------------------------------------------------------------
 async fn handle_mcp_get() -> impl IntoResponse {
-    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
-     r#"{"server":"mcp-legifrance","status":"ok","protocol":"MCP 2025-03-26"}"#)
+    // Streamable HTTP : ce serveur n'ouvre pas de flux SSE ; la spec impose 405.
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")], "Méthode non supportée : utilisez POST")
+}
+
+/// Protection DNS-rebinding (spec MCP, « Security Warning ») : une requête
+/// portant un en-tête Origin doit venir de localhost ou d'une origine listée
+/// dans MCP_ALLOWED_ORIGINS (séparées par des virgules).
+fn origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else { return true };
+    let host = origin.split("://").nth(1).unwrap_or(origin);
+    let host = host.split('/').next().unwrap_or("");
+    let bare = host.rsplit_once(':').map(|(h, p)| if p.chars().all(|c| c.is_ascii_digit()) { h } else { host }).unwrap_or(host);
+    if matches!(bare, "localhost" | "127.0.0.1" | "[::1]") { return true; }
+    std::env::var("MCP_ALLOWED_ORIGINS").map(|l| l.split(',').any(|o| o.trim() == origin)).unwrap_or(false)
 }
 
 async fn handle_health() -> impl IntoResponse { (StatusCode::OK, "OK") }
 
 async fn handle_mcp(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    if !origin_allowed(&headers) {
+        return (StatusCode::FORBIDDEN, "Origin non autorisée").into_response();
+    }
     let text = match std::str::from_utf8(&body) {
         Ok(s) => s,
         Err(_) => return json_response(JsonRpcResponse::err(None, -32700, "Corps non-UTF-8")),
@@ -273,14 +291,25 @@ async fn handle_mcp(
         let reqs = val.as_array().cloned().unwrap_or_default();
         let mut responses = Vec::new();
         for req_val in reqs {
+            let is_notification = req_val.get("id").is_none();
             let resp = process_request(req_val, &state).await;
-            responses.push(serde_json::to_value(resp).unwrap_or(Value::Null));
+            if !is_notification {
+                responses.push(serde_json::to_value(resp).unwrap_or(Value::Null));
+            }
+        }
+        if responses.is_empty() {
+            return StatusCode::ACCEPTED.into_response();
         }
         return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
                 serde_json::to_string(&responses).unwrap_or_default())
             .into_response();
     }
+    let is_notification = val.get("id").is_none();
     let resp = process_request(val, &state).await;
+    if is_notification {
+        // Notification (ex. notifications/initialized) : 202 Accepted, sans corps.
+        return StatusCode::ACCEPTED.into_response();
+    }
     json_response(resp)
 }
 
@@ -292,25 +321,37 @@ async fn process_request(val: Value, state: &AppState) -> JsonRpcResponse {
     let id = req.id.clone();
     match req.method.as_str() {
         "initialize" => {
+            // Négociation : on renvoie la version du client si on la supporte,
+            // sinon la nôtre la plus récente.
+            const SUPPORTED: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+            let wanted = req.params.as_ref().and_then(|p| p["protocolVersion"].as_str()).unwrap_or("");
+            let version: &'static str = SUPPORTED.iter().copied().find(|v| *v == wanted).unwrap_or(SUPPORTED[0]);
+            let n_tools = state.tools.len();
             let result = InitializeResult {
-                protocol_version: "2025-03-26",
+                protocol_version: version,
                 capabilities: Capabilities { tools: ToolsCapability { list_changed: false } },
                 server_info: ServerInfo { name: "legifrance", version: env!("CARGO_PKG_VERSION") },
-                instructions: "Serveur MCP pour l'API Légifrance (PISTE). \
-                    62 outils couvrant : codes en vigueur (table des matières, articles par ID ou numéro, \
-                    sections, historique, liens), lois et règlements LOGI, Journal Officiel (JORF), \
-                    conventions collectives (KALI), délibérations CNIL, accords d'entreprise (ACCO), \
-                    circulaires, dossiers législatifs, jurisprudence administrative (JADE), \
-                    tableaux réglementaires, agenda réglementaire, et recherche plein texte multi-fonds. \
-                    Prérequis : variables d'environnement LEGIFRANCE_CLIENT_ID et LEGIFRANCE_CLIENT_SECRET.",
+                instructions: format!("Serveur MCP pour l'API Légifrance (PISTE) — {n_tools} outils : recherche plein texte multi-fonds \
+                    (codes, LODA, JORF, KALI, jurisprudence JURI/CETAT/CONSTIT/JUFI, CNIL, circulaires, accords d'entreprise), \
+                    consultation des codes (table des matières, sections, articles par ID, numéro, ELI, version à une date), \
+                    lois/décrets, Journal Officiel, conventions collectives, dossiers législatifs, débats et questions \
+                    parlementaires, BOCC, BODMR, documents administratifs. \
+                    Prérequis : LEGIFRANCE_CLIENT_ID et LEGIFRANCE_CLIENT_SECRET (application PISTE)."),
             };
             JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap())
         }
-        "notifications/initialized" => JsonRpcResponse::ok(id, json!({})),
+        m if m.starts_with("notifications/") => JsonRpcResponse::ok(id, json!({})),
         "ping" => JsonRpcResponse::ok(id, json!({})),
         "tools/list" => {
-            let result = ToolsListResult { tools: state.tools.as_ref().clone() };
-            JsonRpcResponse::ok(id, serde_json::to_value(result).unwrap())
+            let tools: Vec<Value> = state.tools.iter().map(|tool| {
+                let mut v = serde_json::to_value(tool).unwrap_or(Value::Null);
+                v["annotations"] = json!({
+                    "readOnlyHint": true, "destructiveHint": false,
+                    "idempotentHint": true, "openWorldHint": true
+                });
+                v
+            }).collect();
+            JsonRpcResponse::ok(id, json!({ "tools": tools }))
         }
         "tools/call" => {
             let params    = req.params.unwrap_or(Value::Null);
@@ -320,7 +361,11 @@ async fn process_request(val: Value, state: &AppState) -> JsonRpcResponse {
                 return JsonRpcResponse::err(id, -32602, "Paramètre 'name' manquant");
             }
             info!("→ tools/call : {tool_name}");
-            let result = dispatch(&tool_name, &args, &state.client).await;
+            let (c, n, a) = (state.client.clone(), tool_name.clone(), args.clone());
+            let result = match tokio::spawn(async move { dispatch(&n, &a, &c).await }).await {
+                Ok(r) => r,
+                Err(e) => mcp::ToolCallResult::error(format!("❌ Erreur interne de l'outil : {e}")),
+            };
             // On journalise le résultat (succès/erreur + aperçu du texte) car
             // jusqu'ici seul l'appel était loggé, jamais son issue — rendant
             // tout diagnostic à distance impossible sans reproduire le bug.

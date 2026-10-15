@@ -20,61 +20,97 @@ const OAUTH_URL_SANDBOX: &str = "https://sandbox-oauth.piste.gouv.fr/api/oauth/t
 /// provisionné pour le mauvais environnement PISTE (cause très fréquente
 /// d'après la FAQ officielle Légifrance : "j'essaie de consommer l'API de
 /// production avec un token obtenu en sandbox").
-pub fn base_url() -> &'static str {
+///
+/// Surcharge avancée (proxy, tests) : LEGIFRANCE_API_URL et
+/// LEGIFRANCE_OAUTH_URL remplacent entièrement les URL ci-dessus.
+pub fn base_url() -> String {
+    if let Ok(u) = std::env::var("LEGIFRANCE_API_URL") {
+        if !u.trim().is_empty() {
+            return u.trim().trim_end_matches('/').to_string();
+        }
+    }
     if std::env::var("LEGIFRANCE_ENV").as_deref() == Ok("sandbox") {
-        BASE_URL_SANDBOX
+        BASE_URL_SANDBOX.to_string()
     } else {
-        BASE_URL
+        BASE_URL.to_string()
     }
 }
 
-pub fn oauth_url() -> &'static str {
+pub fn oauth_url() -> String {
+    if let Ok(u) = std::env::var("LEGIFRANCE_OAUTH_URL") {
+        if !u.trim().is_empty() {
+            return u.trim().to_string();
+        }
+    }
     if std::env::var("LEGIFRANCE_ENV").as_deref() == Ok("sandbox") {
-        OAUTH_URL_SANDBOX
+        OAUTH_URL_SANDBOX.to_string()
     } else {
-        OAUTH_URL
+        OAUTH_URL.to_string()
     }
 }
 
-// Mapping noms courts → IDs LEGITEXT
+// Mapping noms courts → (ID LEGITEXT, intitulé officiel).
+// L'intitulé est la valeur attendue par les facettes NOM_CODE / TEXT_NOM_CODE
+// de POST /search (cf. exemples-d-utilisation-de-l-api.docx §7).
+// Pour tout autre code, resolve_code_dyn (tools.rs) interroge /list/code.
+pub const CODES: &[(&str, &str, &str)] = &[
+    ("civil",                    "LEGITEXT000006070721", "Code civil"),
+    ("penal",                    "LEGITEXT000006070719", "Code pénal"),
+    ("travail",                  "LEGITEXT000006072050", "Code du travail"),
+    ("commerce",                 "LEGITEXT000005634379", "Code de commerce"),
+    ("consommation",             "LEGITEXT000006069565", "Code de la consommation"),
+    ("procedure_civile",         "LEGITEXT000006070716", "Code de procédure civile"),
+    ("procedure_penale",         "LEGITEXT000006071154", "Code de procédure pénale"),
+    ("sante_publique",           "LEGITEXT000006072665", "Code de la santé publique"),
+    ("education",                "LEGITEXT000006071191", "Code de l'éducation"),
+    ("environnement",            "LEGITEXT000006074220", "Code de l'environnement"),
+    ("securite_sociale",         "LEGITEXT000006073189", "Code de la sécurité sociale"),
+    ("general_collectivites",    "LEGITEXT000006070633", "Code général des collectivités territoriales"),
+    ("urbanisme",                "LEGITEXT000006074075", "Code de l'urbanisme"),
+    ("propriete_intellectuelle", "LEGITEXT000006069414", "Code de la propriété intellectuelle"),
+    ("assurances",               "LEGITEXT000006073984", "Code des assurances"),
+    ("monetaire_financier",      "LEGITEXT000006072026", "Code monétaire et financier"),
+];
+
+#[allow(dead_code)]
 pub fn code_ids() -> HashMap<&'static str, &'static str> {
-    let mut m = HashMap::new();
-    m.insert("civil",                    "LEGITEXT000006070721");
-    m.insert("penal",                    "LEGITEXT000006070719");
-    m.insert("travail",                  "LEGITEXT000006072050");
-    m.insert("commerce",                 "LEGITEXT000005634379");
-    m.insert("consommation",             "LEGITEXT000006069565");
-    m.insert("procedure_civile",         "LEGITEXT000006070716");
-    m.insert("procedure_penale",         "LEGITEXT000006071154");
-    m.insert("sante_publique",           "LEGITEXT000006072665");
-    m.insert("education",                "LEGITEXT000006071191");
-    m.insert("environnement",            "LEGITEXT000006074220");
-    m.insert("securite_sociale",         "LEGITEXT000006073189");
-    m.insert("general_collectivites",    "LEGITEXT000006070633");
-    m.insert("urbanisme",                "LEGITEXT000006074075");
-    m.insert("propriete_intellectuelle", "LEGITEXT000006069414");
-    m.insert("assurances",               "LEGITEXT000006073984");
-    m.insert("monetaire_financier",      "LEGITEXT000006072026");
-    m
+    CODES.iter().map(|(k, id, _)| (*k, *id)).collect()
 }
 
+fn norm_key(code: &str) -> String {
+    code.trim().to_lowercase().replace([' ', '-'], "_")
+}
+
+/// Intitulé officiel d'un code à partir de son nom court ("civil"), de son ID
+/// LEGITEXT ou de son intitulé déjà complet ("Code civil").
+pub fn code_title(code: &str) -> Option<&'static str> {
+    let key = norm_key(code);
+    CODES
+        .iter()
+        .find(|(k, id, title)| *k == key || *id == code.trim() || title.to_lowercase() == code.trim().to_lowercase())
+        .map(|(_, _, title)| *title)
+}
+
+/// Résolution statique (sans réseau) : nom court ou ID LEGITEXT → ID LEGITEXT.
 pub fn resolve_code(code: &str) -> Result<String> {
+    let code = code.trim();
     if code.starts_with("LEGITEXT") {
         return Ok(code.to_string());
     }
-    let key = code.to_lowercase().replace(' ', "_").replace('-', "_");
-    let ids = code_ids();
-    match ids.get(key.as_str()) {
-        Some(id) => Ok(id.to_string()),
-        None => {
-            let known: Vec<&str> = ids.keys().copied().collect();
-            anyhow::bail!(
-                "Code non reconnu : '{}'. Noms valides : {}. Ou utilisez directement un ID LEGITEXT...",
-                code,
-                known.join(", ")
-            )
-        }
+    let key = norm_key(code);
+    if let Some((_, id, _)) = CODES
+        .iter()
+        .find(|(k, _, title)| *k == key || title.to_lowercase() == code.to_lowercase())
+    {
+        return Ok((*id).to_string());
     }
+    let known: Vec<&str> = CODES.iter().map(|(k, _, _)| *k).collect();
+    anyhow::bail!(
+        "Code non reconnu : '{}'. Noms courts valides : {}. Sinon utilisez un ID LEGITEXT \
+         (cherchez-le avec legifrance_lister_codes).",
+        code,
+        known.join(", ")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -143,15 +179,26 @@ impl LegifranceClient {
                 (obtenus sur https://piste.gouv.fr)."
             );
         }
-        let resp = self.agent
-            .post(oauth_url())
+        let resp = match self.agent
+            .post(&oauth_url())
             .send_form(&[
                 ("grant_type",    "client_credentials"),
                 ("client_id",     &self.client_id),
                 ("client_secret", &self.client_secret),
                 ("scope",         "openid"),
-            ])
-            .context("Erreur réseau lors de l'obtention du token OAuth2")?;
+            ]) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                let detail: String = r.into_string().unwrap_or_default().chars().take(300).collect();
+                anyhow::bail!(
+                    "Authentification PISTE refusée (HTTP {code}) sur {} : {detail}. \
+                     Vérifiez LEGIFRANCE_CLIENT_ID / LEGIFRANCE_CLIENT_SECRET et que \
+                     l'environnement (LEGIFRANCE_ENV) correspond à celui de votre application PISTE.",
+                    oauth_url()
+                );
+            }
+            Err(e) => return Err(anyhow::anyhow!("Erreur réseau lors de l'obtention du token OAuth2 : {e}")),
+        };
         let body: Value = resp.into_json().context("Réponse OAuth2 non-JSON")?;
         let token = body["access_token"]
             .as_str()

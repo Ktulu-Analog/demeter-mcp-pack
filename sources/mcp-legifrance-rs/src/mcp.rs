@@ -61,7 +61,7 @@ pub struct InitializeResult {
     pub capabilities: Capabilities,
     #[serde(rename = "serverInfo")]
     pub server_info: ServerInfo,
-    pub instructions: &'static str,
+    pub instructions: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -73,6 +73,7 @@ pub struct ToolDef {
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 pub struct ToolsListResult {
     pub tools: Vec<ToolDef>,
 }

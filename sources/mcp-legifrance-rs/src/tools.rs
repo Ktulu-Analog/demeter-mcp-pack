@@ -4,8 +4,8 @@
 // Année   : 2026
 // ============================================================================
 
-use crate::client::{LegifranceClient, resolve_code};
-use crate::fmt::{fmt_article, fmt_search, fmt_toc, fmt_date, strip_html, today};
+use crate::client::{code_title, resolve_code, LegifranceClient};
+use crate::fmt::*;
 use crate::mcp::{ToolCallResult, ToolDef};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -92,6 +92,7 @@ pub fn all_tools() -> Vec<ToolDef> {
     v.push(tool_lister_docs_admins());
     // ── Utilitaires ──
     v.push(tool_commit_id());
+    v.push(tool_ping());
     v
 }
 
@@ -177,6 +178,7 @@ pub async fn dispatch(name: &str, args: &Value, client: &LegifranceClient) -> To
         "legifrance_lister_docs_admins"            => do_lister_docs_admins(args, client).await,
         // Utilitaires
         "legifrance_commit_id"                     => do_commit_id(client).await,
+        "legifrance_ping"                          => do_ping(client).await,
         other => Err(anyhow::anyhow!("Outil inconnu : {other}")),
     };
     match r {
@@ -207,12 +209,19 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 
 fn search_schema(extra: Option<Value>) -> Value {
     let mut props = json!({
-        "query":      { "type": "string",  "description": "Termes de recherche" },
-        "nb_resultats": { "type": "integer", "minimum": 1, "maximum": 20, "default": 5 },
-        "fond":       { "type": "string",  "description": "ALL, CODE_DATE, LODA_DATE, JORF, KALI, CIRC, JADE, DOSSIER_LEGISLATIF (défaut: ALL)" },
-        "date_debut": { "type": "string",  "description": "Date début YYYY-MM-DD" },
-        "date_fin":   { "type": "string",  "description": "Date fin YYYY-MM-DD" },
-        "tri":        { "type": "string",  "description": "PERTINENCE, DATE_ASC, DATE_DESC" }
+        "query":        { "type": "string",  "description": "Termes de recherche" },
+        "nb_resultats": { "type": "integer", "minimum": 1, "maximum": 100, "default": 5 },
+        "page":         { "type": "integer", "minimum": 1, "default": 1, "description": "Numéro de page" },
+        "fond":         { "type": "string",  "description": "ALL (défaut), CODE_DATE, CODE_ETAT, LODA_DATE, LODA_ETAT, JORF, KALI, CIRC, ACCO, CNIL, CONSTIT, CETAT (jurisprudence administrative), JURI (judiciaire), JUFI (financière). Alias acceptés : JADE→CETAT, CODE→CODE_DATE, LODA→LODA_DATE." },
+        "date_debut":   { "type": "string",  "description": "Date début YYYY-MM-DD (pour CODE_DATE : date de version recherchée)" },
+        "date_fin":     { "type": "string",  "description": "Date fin YYYY-MM-DD" },
+        "tri":          { "type": "string",  "description": "PERTINENCE (défaut), DATE_DESC, DATE_ASC — traduits selon le fond ; les tris natifs du fond (ex. SIGNATURE_DATE_DESC) sont aussi acceptés" },
+        "code":         { "type": "string",  "description": "Restreindre à un code (ex: 'civil', 'travail', 'Code de la route'). Bascule automatiquement sur le fond CODE_DATE si fond=ALL." },
+        "nature":       { "type": "string",  "description": "Nature du texte (LOI, DECRET, ORDONNANCE, ARRETE…) — fonds JORF, LODA_DATE, LODA_ETAT uniquement" },
+        "statut":       { "type": "string",  "description": "État juridique (VIGUEUR, ABROGE…) — fonds LODA_ETAT, CODE_ETAT, KALI" },
+        "type_champ":   { "type": "string",  "description": "Champ visé : ALL (défaut), TITLE, ARTICLE, NUM_ARTICLE, NUM, NOR, TEXTE, IDCC, NUM_AFFAIRE, ECLI… (voir doc API)" },
+        "type_recherche": { "type": "string", "description": "UN_DES_MOTS (défaut), TOUS_LES_MOTS_DANS_UN_CHAMP, EXACTE, AUCUN_DES_MOTS, AUCUNE_CORRESPONDANCE_A_CETTE_EXPRESSION" },
+        "proximite":    { "type": "integer", "description": "Distance maximale en mots entre les termes (optionnel)" }
     });
     if let Some(extra_props) = extra.and_then(|v| v.as_object().cloned()) {
         for (k, v) in extra_props { props[k] = v; }
@@ -225,15 +234,12 @@ fn search_schema(extra: Option<Value>) -> Value {
 /// erreur côté API plutôt qu'un filtre silencieusement ignoré.
 fn date_facette(fond: &str) -> Option<&'static str> {
     match fond {
-        "CODE_ETAT"                        => None,
-        "CODE_DATE"                        => Some("DATE_VERSION"),
-        "LODA_ETAT"                        => Some("TEXT_DATE_SIGNATURE"),
+        "CODE_ETAT"                          => None,
+        "CODE_DATE"                          => Some("DATE_VERSION"),
+        "LODA_ETAT"                          => Some("TEXT_DATE_SIGNATURE"),
         "CONSTIT" | "CETAT" | "JURI" | "JUFI" => Some("DATE_DECISION"),
-        "CNIL"                              => Some("DATE_DELIB"),
-        "BOCC"                              => Some("INTERVAL_PUBLICATION"),
-        "DEBAT_PARLEMENTAIRE"               => Some("DATE_PUBLICATION"),
-        "QUESTION_ECRITE"                   => Some("DATE_PUBLICATION"),
-        // JORF, LODA_DATE, CIRC, KALI, ACCO, et tout fond non listé.
+        "CNIL"                               => Some("DATE_DELIB"),
+        // JORF, LODA_DATE, CIRC, KALI, ACCO
         _ => Some("DATE_SIGNATURE"),
     }
 }
@@ -251,63 +257,159 @@ fn nature_facette(fond: &str) -> Option<&'static str> {
     }
 }
 
-fn build_search_body(args: &Value, fond: &str) -> Value {
-    let fond_val = {
-        let f = str_arg(args, "fond");
-        if f.is_empty() { fond } else { f }
+const FONDS: &[&str] = &[
+    "JORF", "CNIL", "CETAT", "JURI", "JUFI", "CONSTIT", "KALI", "CODE_DATE", "CODE_ETAT",
+    "LODA_DATE", "LODA_ETAT", "ALL", "CIRC", "ACCO",
+];
+const TYPES_CHAMP: &[&str] = &[
+    "ALL", "TITLE", "TABLE", "NOR", "NUM", "ADVANCED_TEXTE_ID", "NUM_DELIB", "NUM_DEC", "NUM_ARTICLE",
+    "ARTICLE", "MINISTERE", "VISA", "NOTICE", "VISA_NOTICE", "TRAVAUX_PREP", "SIGNATURE", "NOTA",
+    "NUM_AFFAIRE", "ABSTRATS", "RESUMES", "TEXTE", "ECLI", "NUM_LOI_DEF", "TYPE_DECISION",
+    "NUMERO_INTERNE", "REF_PUBLI", "RESUME_CIRC", "TEXTE_REF", "TITRE_LOI_DEF", "RAISON_SOCIALE",
+    "MOTS_CLES", "IDCC",
+];
+const TYPES_RECHERCHE: &[&str] = &[
+    "UN_DES_MOTS", "EXACTE", "TOUS_LES_MOTS_DANS_UN_CHAMP", "AUCUN_DES_MOTS",
+    "AUCUNE_CORRESPONDANCE_A_CETTE_EXPRESSION",
+];
+
+/// Valide le fond contre l'enum du swagger (SearchRequestDTO.fond) et traduit
+/// les alias courants. « JADE » ou « DOSSIER_LEGISLATIF » ne sont PAS des
+/// valeurs valides de /search (→ HTTP 400).
+fn norm_fond(f: &str) -> Result<String> {
+    let u = f.trim().to_uppercase().replace(['-', ' '], "_");
+    if u.is_empty() { return Ok("ALL".into()); }
+    let m = match u.as_str() {
+        "JADE" | "CE" | "CONSEIL_ETAT" => "CETAT",
+        "CODE" | "CODES" => "CODE_DATE",
+        "LODA" | "LEGI" => "LODA_DATE",
+        "CASS" | "JUDICIAIRE" => "JURI",
+        "CONSTITUTIONNEL" => "CONSTIT",
+        "CIRCULAIRE" | "CIRCULAIRES" => "CIRC",
+        other => other,
     };
-    let mut body = json!({
+    if FONDS.contains(&m) { return Ok(m.to_string()); }
+    anyhow::bail!(
+        "Fond '{f}' non pris en charge par /search. Valeurs valides : {}. \
+         Dossiers législatifs, débats, questions écrites, BOCC, BODMR et documents \
+         administratifs ont leurs propres outils legifrance_lister_*.",
+        FONDS.join(", ")
+    )
+}
+
+/// Tris valides par fond (source : description-des-tris-et-filtres-de-l-api.xlsx).
+fn valid_sorts(fond: &str) -> &'static [&'static str] {
+    match fond {
+        "JORF" | "LODA_DATE" | "LODA_ETAT" => &["PERTINENCE", "SIGNATURE_DATE_DESC", "SIGNATURE_DATE_ASC", "PUBLICATION_DATE_DESC", "PUBLICATION_DATE_ASC"],
+        "CIRC" => &["PERTINENCE", "SIGNATURE_DATE_DESC", "SIGNATURE_DATE_ASC", "PUBLI_DATE_DESC", "PUBLI_DATE_ASC"],
+        "JURI" | "JUFI" | "CETAT" | "CONSTIT" | "ACCO" => &["PERTINENCE", "DATE_DESC", "DATE_ASC"],
+        "KALI" => &["PERTINENCE", "MODIFICATION_DATE_DESC", "SIGNATURE_DATE_DESC", "SIGNATURE_DATE_ASC"],
+        "CNIL" => &["PERTINENCE", "DATE_DECISION_DESC", "DATE_DECISION_ASC"],
+        _ => &["PERTINENCE"],
+    }
+}
+
+/// Traduit le tri générique (PERTINENCE / DATE_DESC / DATE_ASC) vers la valeur
+/// native du fond ; repli sur PERTINENCE (le champ `sort` est obligatoire).
+fn sort_for_fond(fond: &str, tri: &str) -> String {
+    let t = tri.trim().to_uppercase();
+    if t.is_empty() { return "PERTINENCE".into(); }
+    let valid = valid_sorts(fond);
+    if valid.contains(&t.as_str()) { return t; }
+    let desc = t == "DATE_DESC";
+    let asc = t == "DATE_ASC";
+    if !desc && !asc { return "PERTINENCE".into(); }
+    let dir = if desc { "DESC" } else { "ASC" };
+    let cand = match fond {
+        "JORF" | "LODA_DATE" | "LODA_ETAT" | "CIRC" | "KALI" => format!("SIGNATURE_DATE_{dir}"),
+        "CNIL" => format!("DATE_DECISION_{dir}"),
+        _ => format!("DATE_{dir}"),
+    };
+    if valid.contains(&cand.as_str()) { cand } else { "PERTINENCE".into() }
+}
+
+fn build_search_body(args: &Value, default_fond: &str) -> Result<Value> {
+    let f = str_arg(args, "fond");
+    let mut fond = norm_fond(if f.is_empty() { default_fond } else { f })?;
+    let dd = str_arg(args, "date_debut");
+    let df = str_arg(args, "date_fin");
+
+    // Filtre « code » : l'API attend le NOM du code (valeurs: ["Code civil"]).
+    let code = str_arg(args, "code").trim().to_string();
+    let mut code_name: Option<String> = None;
+    if !code.is_empty() {
+        let name = match code_title(&code) {
+            Some(t) => t.to_string(),
+            None if code.starts_with("LEGITEXT") => anyhow::bail!(
+                "Le filtre 'code' attend un nom de code (ex: 'civil' ou 'Code de la route'), pas un ID LEGITEXT."),
+            None => code.clone(),
+        };
+        if fond == "ALL" { fond = "CODE_DATE".into(); }
+        if fond == "CODE_DATE" || fond == "CODE_ETAT" { code_name = Some(name); }
+    }
+
+    let type_champ = { let c = str_arg(args, "type_champ").to_uppercase(); if c.is_empty() { "ALL".to_string() } else { c } };
+    if !TYPES_CHAMP.contains(&type_champ.as_str()) {
+        anyhow::bail!("type_champ '{type_champ}' invalide. Valeurs : {}", TYPES_CHAMP.join(", "));
+    }
+    let type_rech = { let c = str_arg(args, "type_recherche").to_uppercase(); if c.is_empty() { "UN_DES_MOTS".to_string() } else { c } };
+    if !TYPES_RECHERCHE.contains(&type_rech.as_str()) {
+        anyhow::bail!("type_recherche '{type_rech}' invalide. Valeurs : {}", TYPES_RECHERCHE.join(", "));
+    }
+    let mut critere = json!({ "typeRecherche": type_rech, "valeur": str_arg(args, "query"), "operateur": "ET" });
+    let prox = int_arg(args, "proximite", 0);
+    if prox > 0 { critere["proximite"] = json!(prox); }
+
+    let mut filtres: Vec<Value> = Vec::new();
+    if let Some(name) = &code_name {
+        let facette = if fond == "CODE_ETAT" { "TEXT_NOM_CODE" } else { "NOM_CODE" };
+        filtres.push(json!({ "facette": facette, "valeurs": [name] }));
+    }
+    // Facette de date selon le fond. DATE_VERSION (CODE_DATE) est une date
+    // unique (singleDate) ; les autres sont des périodes (dates.start/end).
+    if fond == "CODE_DATE" {
+        let d = if !dd.is_empty() { dd } else if !df.is_empty() { df } else { "" };
+        let d = if d.is_empty() { today() } else { d.to_string() };
+        filtres.push(json!({ "facette": "DATE_VERSION", "singleDate": d }));
+    } else if (!dd.is_empty() || !df.is_empty()) && fond != "ALL" {
+        if let Some(facette) = date_facette(&fond) {
+            let mut dates = json!({});
+            if !dd.is_empty() { dates["start"] = json!(dd); }
+            if !df.is_empty() { dates["end"] = json!(df); }
+            filtres.push(json!({ "facette": facette, "dates": dates }));
+        }
+    }
+    let nature = str_arg(args, "nature");
+    if !nature.is_empty() {
+        if let Some(facette) = nature_facette(&fond) {
+            filtres.push(json!({ "facette": facette, "valeurs": [nature.to_uppercase()] }));
+        }
+    }
+    let statut = str_arg(args, "statut");
+    if !statut.is_empty() {
+        let facette = match fond.as_str() {
+            "LODA_ETAT" | "CODE_ETAT" => Some("TEXT_LEGAL_STATUS"),
+            "KALI" => Some("LEGAL_STATUS"),
+            _ => None,
+        };
+        if let Some(fa) = facette {
+            filtres.push(json!({ "facette": fa, "valeurs": [statut.to_uppercase()] }));
+        }
+    }
+
+    Ok(json!({
+        "fond": fond,
         "recherche": {
-            "champs": [{
-                "typeChamp": "ALL",
-                "criteres": [{ "typeRecherche": "UN_DES_MOTS", "valeur": str_arg(args, "query"), "operateur": "ET" }],
-                "operateur": "ET"
-            }],
+            "champs": [{ "typeChamp": type_champ, "criteres": [critere], "operateur": "ET" }],
             "operateur": "ET",
             "pageNumber": int_arg(args, "page", 1).max(1),
             "pageSize":   int_arg(args, "nb_resultats", 5).clamp(1, 100),
-            "sort":       str_arg(args, "tri"),
-            "typePagination": "DEFAUT",
+            "sort":       sort_for_fond(&fond, str_arg(args, "tri")),
+            "typePagination": if type_champ == "NUM_ARTICLE" { "ARTICLE" } else { "DEFAUT" },
             "fromAdvancedRecherche": false,
-            "filtres": []
-        },
-        "fond": fond_val
-    });
-    let dd = str_arg(args, "date_debut");
-    let df = str_arg(args, "date_fin");
-    // CORRECTION vs référence : la facette de date dépend du fond — utiliser
-    // systématiquement "DATE_VERSION" fait échouer la recherche (ou pire,
-    // 500) pour la plupart des fonds autres que CODE_DATE.
-    if (!dd.is_empty() || !df.is_empty()) && fond_val != "ALL" {
-        if let Some(facette) = date_facette(fond_val) {
-            let filtres = body["recherche"]["filtres"].as_array_mut().unwrap();
-            filtres.push(json!({
-                "facette": facette,
-                "dates": {
-                    "start": if dd.is_empty() { Value::Null } else { json!(dd) },
-                    "end":   if df.is_empty() { Value::Null } else { json!(df) }
-                }
-            }));
+            "filtres": filtres
         }
-    }
-    if let Some(code) = args["code"].as_str() {
-        if let Ok(code_id) = resolve_code(code) {
-            body["recherche"]["filtres"].as_array_mut().unwrap()
-                .push(json!({ "facette": "CODE_ID", "valeur": code_id }));
-        }
-    }
-    if let Some(nature) = args["nature"].as_str() {
-        // CORRECTION vs référence : n'envoyer la facette NATURE que pour les
-        // fonds qui l'exposent réellement (JORF, LODA_DATE, LODA_ETAT) —
-        // sinon 500 côté API pour CODE/CETAT/JURI/JUFI/KALI/ACCO.
-        if !nature.is_empty() {
-            if let Some(facette) = nature_facette(fond_val) {
-                body["recherche"]["filtres"].as_array_mut().unwrap()
-                    .push(json!({ "facette": facette, "valeur": nature }));
-            }
-        }
-    }
-    body
+    }))
 }
 
 // ============================================================================
@@ -346,56 +448,29 @@ fn tool_suggerer_acco() -> ToolDef {
     }
 }
 async fn do_suggerer_acco(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let texte = require_str(args, "texte")?;
-    let body  = json!({ "searchText": texte });
-    let data  = client.post("/suggest/acco", body).await?;
-    let results = data["results"].as_object()
-        .map(|o| o.values().flat_map(|v| v.as_array().cloned().unwrap_or_default()).collect::<Vec<_>>())
-        .or_else(|| data["results"].as_array().cloned())
-        .unwrap_or_default();
-    if results.is_empty() { return Ok(format!("Aucune suggestion entreprise pour : « {texte} »")); }
-    let mut lines = vec![format!("**Entreprises suggérées pour « {texte} »**\n")];
-    for r in results.iter().take(20) {
-        let rs   = r["raisonSociale"].as_str().or_else(|| r["rs"].as_str())
-                    .or_else(|| r["title"].as_str()).unwrap_or("");
-        let siret = r["siret"].as_str().unwrap_or("");
-        let id    = r["id"].as_str().unwrap_or("");
-        let mut line = format!("- {rs}");
-        if !siret.is_empty() { line.push_str(&format!(" — SIRET {siret}")); }
-        if !id.is_empty()    { line.push_str(&format!(" — `{id}`")); }
-        lines.push(line);
-    }
-    Ok(lines.join("\n"))
+    let query = require_any(args, &["query", "texte"])?;
+    let data = client.post("/suggest/acco", json!({ "searchText": query })).await?;
+    Ok(fmt_suggest(&data, query, "d'accords"))
 }
 
 fn tool_suggerer_pdc() -> ToolDef {
-    ToolDef {
-        name: "legifrance_suggerer_pdc".into(),
-        description: "Suggestions pour le plan de classement des débats parlementaires.".into(),
-        input_schema: json!({
-            "type": "object", "required": ["texte"],
-            "properties": {
-                "texte": { "type": "string", "description": "Début du terme à compléter" }
-            }
-        }),
-    }
+    mk("legifrance_suggerer_pdc",
+       "Suggestions d'entrées du plan de classement (jurisprudence, etc.) à partir d'un texte partiel.",
+       json!({ "type": "object", "required": ["query"], "properties": {
+           "query":  { "type": "string", "description": "Texte partiel" },
+           "origin": { "type": "string", "description": "Origine du plan de classement (optionnel)" },
+           "fond":   { "type": "string", "description": "Fond concerné (optionnel, ex. CETAT, JURI)" }
+       }}))
 }
 async fn do_suggerer_pdc(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let texte = require_str(args, "texte")?;
-    let body  = json!({ "searchText": texte });
-    let data  = client.post("/suggest/pdc", body).await?;
-    let results = data["results"].as_object()
-        .map(|o| o.values().flat_map(|v| v.as_array().cloned().unwrap_or_default()).collect::<Vec<_>>())
-        .or_else(|| data["results"].as_array().cloned())
-        .unwrap_or_default();
-    if results.is_empty() { return Ok(format!("Aucune suggestion PDC pour : « {texte} »")); }
-    let mut lines = vec![format!("**Suggestions PDC pour « {texte} »**\n")];
-    for r in results.iter().take(20) {
-        let t   = r["title"].as_str().or_else(|| r["titre"].as_str()).unwrap_or("");
-        let id  = r["id"].as_str().unwrap_or("");
-        lines.push(format!("- {t}{}", if id.is_empty() { String::new() } else { format!(" — `{id}`") }));
+    let query = require_str(args, "query")?;
+    let mut body = json!({ "searchText": query });
+    for k in ["origin", "fond"] {
+        let v = str_arg(args, k);
+        if !v.is_empty() { body[k] = json!(if k == "fond" { v.to_uppercase() } else { v.to_string() }); }
     }
-    Ok(lines.join("\n"))
+    let data = client.post("/suggest/pdc", body).await?;
+    Ok(fmt_suggest(&data, query, "du plan de classement"))
 }
 
 // ============================================================================
@@ -416,82 +491,75 @@ fn tool_lister_codes() -> ToolDef {
     }
 }
 fn tool_consulter_code() -> ToolDef {
-    ToolDef {
-        name: "legifrance_consulter_code".into(),
-        description: "Consulte la table des matières structurée d'un code juridique français. \
-            Retourne la hiérarchie des parties, livres, titres et articles avec leurs identifiants.".into(),
-        input_schema: json!({ "type": "object", "required": ["code"], "properties": { "code": { "type": "string", "description": "Nom du code ('civil', 'travail', 'penal', etc.) ou ID LEGITEXT..." }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD (défaut: aujourd'hui)" } } }),
-    }
+    mk("legifrance_consulter_code",
+       "Table des matières d'un code (parties, livres, titres, chapitres, sections). \
+        Les identifiants de section retournés s'utilisent avec legifrance_section_par_cid.",
+       json!({ "type": "object", "required": ["code"], "properties": {
+           "code": { "type": "string", "description": "Nom court (civil, penal, travail, commerce, consommation…) ou ID LEGITEXT ; tout autre nom de code est résolu automatiquement" },
+           "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD (défaut : aujourd'hui)" },
+           "profondeur": { "type": "integer", "minimum": 1, "maximum": 10, "default": 4, "description": "Niveaux d'arborescence affichés" },
+           "inclure_articles": { "type": "boolean", "default": false, "description": "Lister aussi les articles (numéro + ID)" }
+       }}))
 }
 fn tool_code_complet() -> ToolDef {
-    ToolDef {
-        name: "legifrance_code_complet".into(),
-        description: "Récupère le contenu complet d'un code juridique avec tous ses articles. \
-            Attention : réponse potentiellement volumineuse. Préférez legifrance_consulter_code \
-            puis legifrance_obtenir_article pour consulter des articles spécifiques.".into(),
-        input_schema: json!({
-            "type": "object", "required": ["code"],
-            "properties": {
-                "code": { "type": "string", "description": "Nom ou ID LEGITEXT du code" },
-                "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" }
-            }
-        }),
-    }
+    mk("legifrance_code_complet",
+       "Consulte un code via /consult/code. Sans section_cid : structure du code. \
+        Avec section_cid : contenu de la section (articles inclus), dans la limite d'environ 40 000 caractères.",
+       json!({ "type": "object", "required": ["code"], "properties": {
+           "code": { "type": "string", "description": "Nom court ou ID LEGITEXT" },
+           "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD (défaut : aujourd'hui)" },
+           "section_cid": { "type": "string", "description": "ID de section (LEGISCTA…) dont on veut le contenu" },
+           "abrogees": { "type": "boolean", "description": "Inclure les parties abrogées" }
+       }}))
 }
 async fn do_code_complet(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let code    = require_str(args, "code")?;
-    let code_id = resolve_code(code)?;
-    let date    = date_arg(args, "date", &today());
-    let body    = json!({ "textId": code_id, "date": date });
-    let data    = client.post("/consult/legi/tableMatieres", body).await?;
-    Ok(fmt_toc(&data, code))
+    let code = require_str(args, "code")?;
+    let text_id = resolve_code_dyn(client, code).await?;
+    let mut body = json!({ "textId": text_id, "date": date_arg(args, "date", &today()) });
+    let sct = str_arg(args, "section_cid");
+    if !sct.is_empty() { body["sctCid"] = json!(sct); }
+    if args["abrogees"].as_bool().unwrap_or(false) { body["abrogated"] = json!(true); }
+    let data = client.post("/consult/code", body).await?;
+    Ok(fmt_legi_text(&data, &text_id))
 }
 
 fn tool_code_par_ancien_id() -> ToolDef {
-    ToolDef {
-        name: "legifrance_code_par_ancien_id".into(),
-        description: "Consulte un code par son ancien identifiant Légifrance. \
-            Utile pour résoudre des références héritées vers des identifiants actuels.".into(),
-        input_schema: json!({
-            "type": "object", "required": ["ancien_id"],
-            "properties": {
-                "ancien_id": { "type": "string", "description": "Ancien identifiant du code" },
-                "date":      { "type": "string", "description": "Date de vigueur YYYY-MM-DD" }
-            }
-        }),
-    }
+    mk("legifrance_code_par_ancien_id",
+       "Récupère un code à partir de son ancien identifiant (ancien ID Légifrance).",
+       json!({ "type": "object", "required": ["ancien_id"], "properties": {
+           "ancien_id": { "type": "string", "description": "Ancien identifiant du code" }
+       }}))
 }
 async fn do_code_par_ancien_id(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let ancien_id = require_str(args, "ancien_id")?;
-    let date      = date_arg(args, "date", &today());
-    let body      = json!({ "oldId": ancien_id, "date": date });
-    let data      = client.post("/consult/legi/tableMatieresByOldId", body).await?;
-    Ok(fmt_toc(&data, ancien_id))
+    let id = require_any(args, &["ancien_id", "id"])?;
+    let data = client.post("/consult/getCodeWithAncienId", json!({ "ancienId": id })).await?;
+    Ok(fmt_toc(&data, id))
 }
 
 fn tool_section_par_cid() -> ToolDef {
-    ToolDef {
-        name: "legifrance_section_par_cid".into(),
-        description: "Récupère le contenu d'une section de code ou de texte par son CID canonique. \
-            Utile pour naviguer dans la structure d'un code (format LEGISCTA...).".into(),
-        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "CID de la section (LEGISCTA...)" }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" } } }),
-    }
+    mk("legifrance_section_par_cid",
+       "Contenu d'une section d'un texte (code, loi) : sous-sections et articles, à partir de son identifiant (LEGISCTA…).",
+       json!({ "type": "object", "required": ["id"], "properties": {
+           "id": { "type": "string", "description": "Identifiant de section (LEGISCTA…)" }
+       }}))
 }
 fn tool_obtenir_article() -> ToolDef {
-    ToolDef {
-        name: "legifrance_obtenir_article".into(),
-        description: "Récupère le texte complet d'un article juridique par son identifiant Légifrance \
-            (format LEGIARTI000...). L'ID s'obtient via legifrance_rechercher ou legifrance_consulter_code.".into(),
-        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant de l'article (LEGIARTI...)" }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" } } }),
-    }
+    mk("legifrance_obtenir_article",
+       "Contenu d'un article à partir de son identifiant (LEGIARTI…, JORFARTI…, KALIARTI…). \
+        Retourne la version désignée par l'ID ; voir legifrance_versions_article pour l'historique.",
+       json!({ "type": "object", "required": ["id"], "properties": {
+           "id": { "type": "string", "description": "Identifiant de l'article" }
+       }}))
 }
 fn tool_article_par_numero() -> ToolDef {
-    ToolDef {
-        name: "legifrance_article_par_numero".into(),
-        description: "Récupère un article d'un code par son numéro (ex: '1382', 'L1234-5', 'R123-1'). \
-            Plus pratique que legifrance_obtenir_article quand on connaît le numéro mais pas l'ID.".into(),
-        input_schema: json!({ "type": "object", "required": ["code", "numero"], "properties": { "code": { "type": "string", "description": "Nom ou ID LEGITEXT du code" }, "numero": { "type": "string", "description": "Numéro de l'article (ex: '1382', 'L1234-1')" }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" } } }),
-    }
+    mk("legifrance_article_par_numero",
+       "Récupère un article d'un code par son numéro (ex. 1240, L1234-1, R. 123-4). \
+        Sans date : version en vigueur. Avec date : version en vigueur à cette date.",
+       json!({ "type": "object", "required": ["code", "numero"], "properties": {
+           "code":   { "type": "string", "description": "Nom court (civil, penal, travail…), nom complet ou ID LEGITEXT" },
+           "numero": { "type": "string", "description": "Numéro de l'article" },
+           "date":   { "type": "string", "description": "Date YYYY-MM-DD (optionnel) : version applicable à cette date" }
+       }}))
 }
 fn tool_article_par_eli() -> ToolDef {
     ToolDef {
@@ -518,45 +586,45 @@ async fn do_article_par_eli(args: &Value, client: &LegifranceClient) -> Result<S
 }
 
 fn tool_articles_meme_numero() -> ToolDef {
-    ToolDef {
-        name: "legifrance_articles_meme_numero".into(),
-        description: "Récupère tous les articles portant le même numéro dans un code. \
-            Utile pour les articles qui ont été renumérotés ou qui existent en plusieurs versions.".into(),
-        input_schema: json!({
-            "type": "object", "required": ["code", "numero"],
-            "properties": {
-                "code":   { "type": "string", "description": "Nom ou ID LEGITEXT du code" },
-                "numero": { "type": "string", "description": "Numéro de l'article" }
-            }
-        }),
-    }
+    mk("legifrance_articles_meme_numero",
+       "Articles portant le même numéro dans d'autres textes/codes (/consult/sameNumArticle). \
+        Fournir soit (code + numero), soit (article_cid + text_cid + numero).",
+       json!({ "type": "object", "properties": {
+           "code":        { "type": "string", "description": "Code de l'article (nom court ou LEGITEXT)" },
+           "numero":      { "type": "string", "description": "Numéro de l'article" },
+           "article_cid": { "type": "string", "description": "CID de l'article (alternative à code)" },
+           "text_cid":    { "type": "string", "description": "CID du texte (alternative à code)" },
+           "date":        { "type": "string", "description": "Date YYYY-MM-DD (défaut : aujourd'hui)" }
+       }}))
 }
 async fn do_articles_meme_numero(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let code    = require_str(args, "code")?;
-    let numero  = require_str(args, "numero")?;
-    let code_id = resolve_code(code)?;
-    let body    = json!({ "id": code_id, "num": numero });
-    let data    = client.post("/consult/getArticlesWithSameNum", body).await?;
-    let articles = data["listArticle"].as_array()
-        .or_else(|| data["articles"].as_array())
-        .cloned()
-        .unwrap_or_default();
-    if articles.is_empty() { return Ok(format!("Aucun article numéroté '{numero}' dans ce code.")); }
-    let mut lines = vec![format!("**{} article(s) portant le numéro '{numero}'**\n", articles.len())];
-    for a in &articles {
-        lines.push(fmt_article(a));
-        lines.push(String::new());
+    let mut art_cid = str_arg(args, "article_cid").to_string();
+    let mut text_cid = str_arg(args, "text_cid").to_string();
+    let mut num = normalize_article_num(str_arg(args, "numero"));
+    if art_cid.is_empty() || text_cid.is_empty() {
+        let code = require_str(args, "code")?;
+        if num.is_empty() { anyhow::bail!("Paramètre 'numero' obligatoire."); }
+        let id = resolve_code_dyn(client, code).await?;
+        let d = client.post("/consult/getArticleWithIdAndNum", json!({ "id": id, "num": num })).await?;
+        let a = d.get("article").unwrap_or(&d);
+        let c = s(a, "cid");
+        art_cid = if c.is_empty() { s(a, "id").to_string() } else { c.to_string() };
+        text_cid = { let x = s(a, "cidTexte"); if x.is_empty() { id } else { x.to_string() } };
+        if num.is_empty() { num = s(a, "num").to_string(); }
+        if art_cid.is_empty() { anyhow::bail!("Article introuvable."); }
     }
-    Ok(lines.join("\n"))
+    if num.is_empty() { anyhow::bail!("Paramètre 'numero' obligatoire."); }
+    let body = json!({ "date": date_arg(args, "date", &today()), "articleCid": art_cid, "textCid": text_cid, "articleNum": num });
+    let data = client.post("/consult/sameNumArticle", body).await?;
+    Ok(fmt_revision_links(&data, &art_cid, "Articles de même numéro"))
 }
 
 fn tool_versions_article() -> ToolDef {
-    ToolDef {
-        name: "legifrance_versions_article".into(),
-        description: "Récupère l'historique complet des versions d'un article (par son CID canonique). \
-            Permet de suivre les modifications législatives d'un article au fil du temps.".into(),
-        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "CID canonique de l'article (LEGIARTI...)" } } }),
-    }
+    mk("legifrance_versions_article",
+       "Historique des versions d'un article (dates de début/fin, état, ID de chaque version).",
+       json!({ "type": "object", "required": ["id"], "properties": {
+           "id": { "type": "string", "description": "Identifiant (CID ou ID) de l'article" }
+       }}))
 }
 fn tool_version_canonique_article() -> ToolDef {
     ToolDef {
@@ -572,25 +640,10 @@ fn tool_version_canonique_article() -> ToolDef {
     }
 }
 async fn do_version_canonique_article(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "article_id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/search/canonicalArticleVersion", body).await?;
-    let mut lines = vec![format!("**Version canonique de l'article `{id}`**\n")];
-    if let Some(obj) = data.as_object() {
-        for (k, v) in obj {
-            if !v.is_null() {
-                let val = match v {
-                    Value::String(s) => s.clone(),
-                    Value::Bool(b)   => b.to_string(),
-                    Value::Number(n) => n.to_string(),
-                    other            => other.to_string(),
-                };
-                if !val.is_empty() { lines.push(format!("- **{k}** : {val}")); }
-            }
-        }
-    }
-    if lines.len() > 1 { Ok(lines.join("\n")) }
-    else { Ok(format!("Aucune information pour `{id}`.")) }
+    let id = require_any(args, &["id", "article_id"])?;
+    let data = client.post("/search/canonicalArticleVersion", json!({ "id": id })).await?;
+    let vs = data["articleVersions"].as_array().cloned().unwrap_or_default();
+    Ok(fmt_article_versions(&vs, id))
 }
 
 fn tool_version_canonique() -> ToolDef {
@@ -610,22 +663,14 @@ fn tool_version_canonique() -> ToolDef {
 }
 async fn do_version_canonique(args: &Value, client: &LegifranceClient) -> Result<String> {
     let cid_text = require_str(args, "cid_text")?;
-    let date     = require_str(args, "date")?;
+    let date = require_str(args, "date")?;
     let mut body = json!({ "cidText": cid_text, "date": date });
     let cid_section = str_arg(args, "cid_section");
     if !cid_section.is_empty() { body["cidSection"] = json!(cid_section); }
-    let data  = client.post("/search/canonicalVersion", body).await?;
-    let mut lines = vec![format!("**Version canonique de `{cid_text}` au {date}**\n")];
-    if let Some(obj) = data.as_object() {
-        for (k, v) in obj {
-            if !v.is_null() {
-                let val = match v { Value::String(s) => s.clone(), other => other.to_string() };
-                if !val.is_empty() { lines.push(format!("- **{k}** : {val}")); }
-            }
-        }
-    }
-    if lines.len() > 1 { Ok(lines.join("\n")) }
-    else { Ok("Aucune information de version canonique trouvée.".into()) }
+    let data = client.post("/search/canonicalVersion", body).await?;
+    let lines = kv_lines(&data);
+    if lines.is_empty() { return Ok("Aucune information de version canonique trouvée.".into()); }
+    Ok(format!("**Version canonique de `{cid_text}` au {date}**\n\n{}", lines.join("\n")))
 }
 
 fn tool_version_proche() -> ToolDef {
@@ -645,22 +690,14 @@ fn tool_version_proche() -> ToolDef {
 }
 async fn do_version_proche(args: &Value, client: &LegifranceClient) -> Result<String> {
     let cid_text = require_str(args, "cid_text")?;
-    let date     = require_str(args, "date")?;
+    let date = require_str(args, "date")?;
     let mut body = json!({ "cidText": cid_text, "date": date });
     let cid_section = str_arg(args, "cid_section");
     if !cid_section.is_empty() { body["cidSection"] = json!(cid_section); }
-    let data  = client.post("/search/nearestVersion", body).await?;
-    let mut lines = vec![format!("**Version la plus proche de `{cid_text}` autour du {date}**\n")];
-    if let Some(obj) = data.as_object() {
-        for (k, v) in obj {
-            if !v.is_null() {
-                let val = match v { Value::String(s) => s.clone(), other => other.to_string() };
-                if !val.is_empty() { lines.push(format!("- **{k}** : {val}")); }
-            }
-        }
-    }
-    if lines.len() > 1 { Ok(lines.join("\n")) }
-    else { Ok("Aucune version proche trouvée.".into()) }
+    let data = client.post("/search/nearestVersion", body).await?;
+    let lines = kv_lines(&data);
+    if lines.is_empty() { return Ok("Aucune version proche trouvée.".into()); }
+    Ok(format!("**Version la plus proche de `{cid_text}` autour du {date}**\n\n{}", lines.join("\n")))
 }
 
 fn tool_a_des_versions() -> ToolDef {
@@ -677,25 +714,19 @@ fn tool_a_des_versions() -> ToolDef {
     }
 }
 async fn do_a_des_versions(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let cid  = require_str(args, "text_cid")?;
-    let path = format!("/chrono/textCid/{cid}");
-    let data = client.get(&path).await?;
-    let has  = data["hasChronolegi"].as_bool()
-        .or_else(|| data["hasVersions"].as_bool())
-        .unwrap_or(false);
-    if has {
-        Ok(format!("✅ Le texte `{cid}` **possède** un historique de versions. Utilisez `legifrance_historique_texte` pour les récupérer."))
-    } else {
-        Ok(format!("ℹ️ Le texte `{cid}` **ne possède pas** de versions historiques enregistrées."))
-    }
+    let id = require_any(args, &["id", "text_cid"])?;
+    let data = client.get(&format!("/chrono/textCid/{id}")).await?;
+    let has = data["chronolegiExists"].as_bool().unwrap_or(false);
+    Ok(if has { format!("✅ `{id}` possède un historique de versions (voir legifrance_historique_texte).") }
+       else { format!("❌ `{id}` n'a pas d'historique de versions.") })
 }
 
 fn tool_liens_concordance() -> ToolDef {
-    ToolDef {
-        name: "legifrance_liens_concordance".into(),
-        description: "Récupère les liens de concordance d'un article (articles équivalents dans d'autres textes).".into(),
-        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant de l'article (LEGIARTI...)" }, "type": { "type": "string", "description": "Type de lien (optionnel)" } } }),
-    }
+    mk("legifrance_liens_concordance",
+       "Liens de concordance d'un article (anciens/nouveaux textes et numéros — ex. recodification).",
+       json!({ "type": "object", "required": ["id"], "properties": {
+           "id": { "type": "string", "description": "Identifiant de l'article (LEGIARTI…)" }
+       }}))
 }
 fn tool_liens_relatifs() -> ToolDef {
     ToolDef {
@@ -710,28 +741,29 @@ fn tool_liens_relatifs() -> ToolDef {
     }
 }
 async fn do_liens_relatifs(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "article_id")?;
-    // CORRECTION vs référence : chemin /consult/relatedLinksArticle,
-    // body {articleId}, pas /consult/relatifs {id}.
-    let body = json!({ "articleId": id });
-    let data = client.post("/consult/relatedLinksArticle", body).await?;
+    let id = require_any(args, &["id", "article_id"])?;
+    let data = client.post("/consult/relatedLinksArticle", json!({ "articleId": id })).await?;
     let mut lines = vec![format!("**Liens relatifs de `{id}`**\n")];
-    if let Some(obj) = data.as_object() {
-        for (section_name, items) in obj {
-            if let Some(arr) = items.as_array() {
-                if !arr.is_empty() {
-                    lines.push(format!("\n**{section_name}** ({})", arr.len()));
-                    for lien in arr.iter().take(10) {
-                        let t   = lien["titre"].as_str().or_else(|| lien["title"].as_str()).unwrap_or("");
-                        let rid = lien["id"].as_str().unwrap_or("");
-                        lines.push(format!("  - {t}{}", if rid.is_empty() { String::new() } else { format!(" — `{rid}`") }));
-                    }
-                }
+    let mut n = 0;
+    for (key, label) in [("liensCitePar", "Cité par"), ("liensCite", "Cite"), ("liensConcordeAvec", "Concorde avec")] {
+        if let Some(arr) = data[key].as_array() {
+            if arr.is_empty() { continue; }
+            lines.push(format!("**{label}** ({})", arr.len()));
+            for l in arr.iter().take(60) {
+                n += 1;
+                let name = ["name", "titre", "title"].iter().map(|k| s(l, k)).find(|x| !x.is_empty()).unwrap_or("");
+                let nat = s(l, "nature");
+                lines.push(format!("- {name}{} — `{}`", if nat.is_empty() { String::new() } else { format!(" [{nat}]") }, ["id", "cidText"].iter().map(|k| s(l, k)).find(|x| !x.is_empty()).unwrap_or("")));
             }
+            lines.push(String::new());
         }
     }
-    if lines.len() > 1 { Ok(lines.join("\n")) }
-    else { Ok(format!("Aucun lien relatif trouvé pour `{id}`.")) }
+    if n == 0 {
+        let kv = kv_lines(&data);
+        if kv.is_empty() { return Ok(format!("Aucun lien relatif pour `{id}`.")); }
+        lines.extend(kv);
+    }
+    Ok(lines.join("\n"))
 }
 
 fn tool_liens_service_public() -> ToolDef {
@@ -747,22 +779,19 @@ fn tool_liens_service_public() -> ToolDef {
     }
 }
 async fn do_liens_service_public(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "article_id")?;
-    // CORRECTION vs référence : chemin /consult/servicePublicLinksArticle,
-    // body {articleCid}, pas /consult/getLinksServicePublic {id}.
-    let body = json!({ "articleCid": id });
+    let id = require_any(args, &["id", "article_cid", "article_id"])?;
+    let mut body = json!({ "articleCid": id });
+    let fond = str_arg(args, "fond");
+    if !fond.is_empty() { body["fond"] = json!(fond.to_uppercase()); }
     let data = client.post("/consult/servicePublicLinksArticle", body).await?;
-    let items = data["liens"].as_array()
-        .or_else(|| data["links"].as_array())
-        .cloned()
-        .unwrap_or_default();
-    if items.is_empty() { return Ok(format!("Aucun lien service-public.fr pour `{id}`.")); }
-    let mut lines = vec![format!("**{} lien(s) service-public.fr**\n", items.len())];
-    for lien in &items {
-        let titre = lien["titre"].as_str().or_else(|| lien["title"].as_str()).unwrap_or("");
-        let url   = lien["url"].as_str().unwrap_or("");
-        if !url.is_empty() { lines.push(format!("- [{titre}]({url})")); }
-        else { lines.push(format!("- {titre}")); }
+    let sp = data["liensSP"].as_object().cloned().unwrap_or_default();
+    if sp.is_empty() { return Ok(format!("Aucun lien service-public.fr pour `{id}`.")); }
+    let mut lines = vec![format!("**Liens service-public.fr pour `{id}`**\n")];
+    for (k, v) in &sp {
+        match v {
+            Value::Array(a) => for x in a { lines.push(format!("- {} — {}", k, x.as_str().map(|s| s.to_string()).unwrap_or_else(|| x.to_string()))); },
+            other => lines.push(format!("- {k} — {}", other.as_str().map(|s| s.to_string()).unwrap_or_else(|| other.to_string()))),
+        }
     }
     Ok(lines.join("\n"))
 }
@@ -780,20 +809,11 @@ fn tool_a_liens_service_public() -> ToolDef {
     }
 }
 async fn do_a_liens_service_public(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "article_id")?;
-    // NOTE : même famille de paramètre que liens_service_public (articleCid).
-    // Chemin /consult/hasLinksServicePublic non confirmé par la référence —
-    // à vérifier en conditions réelles si ce outil échoue.
-    let body = json!({ "articleCid": id });
-    let data = client.post("/consult/hasLinksServicePublic", body).await?;
-    let has  = data["hasLinks"].as_bool()
-        .or_else(|| data["hasLinksServicePublic"].as_bool())
-        .unwrap_or(false);
-    if has {
-        Ok(format!("✅ L'article `{id}` **possède** des liens service-public.fr. Utilisez `legifrance_liens_service_public` pour les récupérer."))
-    } else {
-        Ok(format!("ℹ️ L'article `{id}` **ne possède pas** de liens service-public.fr."))
-    }
+    let id = require_any(args, &["id", "article_cid", "article_id"])?;
+    // Le corps de cette opération est un TABLEAU de CID ; la réponse liste ceux qui ont des liens.
+    let data = client.post("/consult/hasServicePublicLinksArticle", json!([id])).await?;
+    let has = data.as_array().map(|a| a.iter().any(|x| x.as_str() == Some(id))).unwrap_or(false);
+    Ok(if has { format!("✅ `{id}` a des liens service-public.fr.") } else { format!("❌ `{id}` n'a pas de lien service-public.fr.") })
 }
 
 // ============================================================================
@@ -801,125 +821,88 @@ async fn do_a_liens_service_public(args: &Value, client: &LegifranceClient) -> R
 // ============================================================================
 
 fn tool_loi_decret() -> ToolDef {
-    ToolDef {
-        name: "legifrance_loi_decret".into(),
-        description: "Consulte le contenu complet d'une loi, décret, ordonnance ou arrêté (fonds LODA). \
-            Retourne les articles structurés du texte.".into(),
-        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant du texte (LEGITEXT..., JORFTEXT...)" }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" } } }),
-    }
+    mk("legifrance_loi_decret",
+       "Texte complet d'une loi, ordonnance, décret ou arrêté (LEGITEXT… ou JORFTEXT…) : articles et sections avec leur contenu. \
+        Pour un texte JORFTEXT la date est ignorée.",
+       json!({ "type": "object", "required": ["id"], "properties": {
+           "id":   { "type": "string", "description": "Identifiant du texte (LEGITEXT… ou JORFTEXT…)" },
+           "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD (défaut : aujourd'hui)" },
+           "sommaire_seulement": { "type": "boolean", "default": false, "description": "Ne retourner que la table des matières" }
+       }}))
 }
 fn tool_legi_part() -> ToolDef {
-    ToolDef {
-        name: "legifrance_legi_part".into(),
-        description: "Récupère une partie d'un texte LEGI par son identifiant de partie. \
-            Utile pour naviguer dans les sous-sections d'un code ou texte volumineux.".into(),
-        input_schema: json!({ "type": "object", "required": [], "properties": { "id": { "type": "string", "description": "Identifiant de la partie LEGI" }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" } } }),
-    }
+    mk("legifrance_legi_part",
+       "Contenu d'un texte du fonds LEGI (/consult/legiPart) : structure et articles à une date donnée.",
+       json!({ "type": "object", "required": ["id"], "properties": {
+           "id":   { "type": "string", "description": "Identifiant (chronical ID) du texte (LEGITEXT…)" },
+           "date": { "type": "string", "description": "Date de consultation YYYY-MM-DD (défaut : aujourd'hui)" }
+       }}))
 }
 fn tool_lister_loda() -> ToolDef {
-    ToolDef {
-        name: "legifrance_lister_loda".into(),
-        description: "Liste les lois, ordonnances et décrets autonomes disponibles dans Légifrance (fonds LODA).".into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "natures":               { "type": "array", "items": { "type": "string" },
-                    "description": "Natures à filtrer (ex: ['LOI', 'ORDONNANCE', 'DECRET', 'ARRETE'])" },
-                "en_vigueur_seulement":  { "type": "boolean", "default": false },
-                "date_debut":            { "type": "string", "description": "Date début YYYY-MM-DD" },
-                "date_fin":              { "type": "string", "description": "Date fin YYYY-MM-DD" },
-                "nb_resultats":          { "type": "integer", "default": 20 }
-            }
-        }),
-    }
+    mk("legifrance_lister_loda",
+       "Liste paginée des textes LODA (lois, ordonnances, décrets, arrêtés) filtrable par nature, état, période de publication ou de signature.",
+       json!({ "type": "object", "properties": {
+           "natures": { "type": "array", "items": { "type": "string" }, "description": "LOI, ORDONNANCE, DECRET, DECRET_LOI, ARRETE, CONSTITUTION, DECISION, CONVENTION, DECLARATION, ACCORD_FONCTION_PUBLIQUE" },
+           "en_vigueur_seulement": { "type": "boolean", "default": false },
+           "statuts": { "type": "array", "items": { "type": "string" }, "description": "États juridiques (VIGUEUR, ABROGE…) — prioritaire sur en_vigueur_seulement" },
+           "date_debut": { "type": "string", "description": "Publication : début YYYY-MM-DD" },
+           "date_fin":   { "type": "string", "description": "Publication : fin YYYY-MM-DD" },
+           "signature_debut": { "type": "string", "description": "Signature : début YYYY-MM-DD" },
+           "signature_fin":   { "type": "string", "description": "Signature : fin YYYY-MM-DD" },
+           "tri": { "type": "string", "description": "PUBLICATION_DATE_DESC|ASC, SIGNATURE_DATE_DESC|ASC, ID_ASC|DESC" },
+           "nb_resultats": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+           "page": { "type": "integer", "minimum": 1, "default": 1 }
+       }}))
 }
 async fn do_lister_loda(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let mut body = json!({ "pageNumber": 1, "pageSize": int_arg(args, "nb_resultats", 20).clamp(1, 100) });
-    if let Some(natures) = args["natures"].as_array() {
-        body["natures"] = json!(natures);
+    let mut body = list_body(args, 20);
+    if let Some(n) = args["natures"].as_array() {
+        body["natures"] = json!(n.iter().filter_map(|x| x.as_str()).map(|x| x.to_uppercase()).collect::<Vec<_>>());
     }
-    if args["en_vigueur_seulement"].as_bool().unwrap_or(false) {
-        body["legalStatus"] = json!(["VIGUEUR"]);
-    }
-    let dd = str_arg(args, "date_debut");
-    let df = str_arg(args, "date_fin");
-    if !dd.is_empty() || !df.is_empty() {
-        let mut pub_date = json!({});
-        if !dd.is_empty() { pub_date["start"] = json!(dd); }
-        if !df.is_empty() { pub_date["end"]   = json!(df); }
-        body["publicationDate"] = pub_date;
-    }
-    let data  = client.post("/list/loda", body).await?;
+    if let Some(st) = args["statuts"].as_array() { body["legalStatus"] = json!(st); }
+    else if args["en_vigueur_seulement"].as_bool().unwrap_or(false) { body["legalStatus"] = json!(["VIGUEUR"]); }
+    let period = |a: &str, b: &str| { let mut p = json!({}); if !a.is_empty() { p["start"] = json!(a); } if !b.is_empty() { p["end"] = json!(b); } p };
+    let (dd, df) = (str_arg(args, "date_debut"), str_arg(args, "date_fin"));
+    if !dd.is_empty() || !df.is_empty() { body["publicationDate"] = period(dd, df); }
+    let (sd, sf) = (str_arg(args, "signature_debut"), str_arg(args, "signature_fin"));
+    if !sd.is_empty() || !sf.is_empty() { body["signatureDate"] = period(sd, sf); }
+    let tri = str_arg(args, "tri");
+    if !tri.is_empty() { body["sort"] = json!(tri.to_uppercase()); }
+    let data = client.post("/list/loda", body).await?;
     let items = data["results"].as_array().cloned().unwrap_or_default();
     if items.is_empty() { return Ok("Aucun texte LODA trouvé.".into()); }
-    let total = data["totalResultNumber"].as_i64().unwrap_or(items.len() as i64);
-    let mut lines = vec![format!("**{total} texte(s) LODA** — {} affiché(s)\n", items.len())];
-    for t in &items {
-        let titre  = t["titre"].as_str().or_else(|| t["title"].as_str()).unwrap_or("?");
-        let nature = t["nature"].as_str().unwrap_or("");
-        let date_p = t["dateParution"].as_str().unwrap_or("");
-        let id     = t["id"].as_str().or_else(|| t["cid"].as_str()).unwrap_or("");
-        let mut line = format!("- **{titre}**");
-        if !nature.is_empty() { line.push_str(&format!(" [{nature}]")); }
-        if !date_p.is_empty() { line.push_str(&format!(" — {date_p}")); }
-        if !id.is_empty()     { line.push_str(&format!(" — `{id}`")); }
-        lines.push(line);
+    let mut lines = vec![format!("**{} texte(s) LODA** — {} affiché(s)\n", total_of(&data, items.len()), items.len())];
+    for r in &items {
+        let (d, f) = (fmt_date(&r["dateDebut"]), fmt_date(&r["dateFin"]));
+        let mut l = format!("- **{}**", { let x = s(r, "titre"); if x.is_empty() { "?" } else { x } });
+        if !s(r, "etat").is_empty() { l.push_str(&format!(" [{}]", s(r, "etat"))); }
+        if !d.is_empty() { l.push_str(&format!(" — {d} → {}", if f.is_empty() || is_open_end(&f) { "en vigueur".into() } else { f })); }
+        let id = { let c = s(r, "cid"); if c.is_empty() { s(r, "id") } else { c } };
+        if !id.is_empty() { l.push_str(&format!(" — `{id}`")); }
+        lines.push(l);
     }
     Ok(lines.join("\n"))
 }
 
 fn tool_historique_texte() -> ToolDef {
-    ToolDef {
-        name: "legifrance_historique_texte".into(),
-        description: "Récupère l'historique complet des versions d'un texte juridique sur une période. \
-            Permet de suivre l'évolution législative d'un code ou d'une loi dans le temps.".into(),
-        input_schema: json!({
-            "type": "object", "required": ["text_cid", "annee_debut", "annee_fin"],
-            "properties": {
-                "text_cid":     { "type": "string",  "description": "CID du texte (ex: LEGITEXT...)" },
-                "annee_debut":  { "type": "integer", "description": "Année de début" },
-                "annee_fin":    { "type": "integer", "description": "Année de fin" },
-                "date_consult": { "type": "string",  "description": "Date de consultation YYYY-MM-DD (défaut: aujourd'hui)" }
-            }
-        }),
-    }
+    mk("legifrance_historique_texte",
+       "Historique des versions d'un texte (code, loi) sur une période d'années : date de chaque version et textes modificateurs. \
+        Permet de suivre l'évolution législative dans le temps.",
+       json!({ "type": "object", "required": ["text_cid", "annee_debut", "annee_fin"], "properties": {
+           "text_cid":     { "type": "string",  "description": "CID du texte (ex: LEGITEXT...)" },
+           "annee_debut":  { "type": "integer", "description": "Année de début" },
+           "annee_fin":    { "type": "integer", "description": "Année de fin" },
+           "date_consult": { "type": "string",  "description": "Date de référence YYYY-MM-DD (défaut : aujourd'hui)" }
+       }}))
 }
 async fn do_historique_texte(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let text_cid    = require_str(args, "text_cid")?;
-    let annee_debut = int_arg(args, "annee_debut", 0);
-    let annee_fin   = int_arg(args, "annee_fin", 0);
-    if annee_debut == 0 || annee_fin == 0 { anyhow::bail!("annee_debut et annee_fin sont obligatoires."); }
-    let date_consult = date_arg(args, "date_consult", &today());
-    let body = json!({
-        "textCid":     text_cid,
-        "dateConsult": date_consult,
-        "startYear":   annee_debut,
-        "endYear":     annee_fin,
-    });
+    let id = require_any(args, &["text_cid", "id", "cid"])?;
+    let (y0, y1) = (int_arg(args, "annee_debut", 0), int_arg(args, "annee_fin", 0));
+    if y0 == 0 || y1 == 0 { anyhow::bail!("Paramètres 'annee_debut' et 'annee_fin' obligatoires."); }
+    // POST /chrono/textCid : ChronoLegiTextRequest (textCid, startYear, endYear, dateConsult tous requis).
+    let body = json!({ "textCid": id, "startYear": y0, "endYear": y1, "dateConsult": date_arg(args, "date_consult", &today()) });
     let data = client.post("/chrono/textCid", body).await?;
-    let regs = data["regroupements"].as_array().cloned().unwrap_or_default();
-    if regs.is_empty() {
-        return Ok(format!("Aucune version trouvée pour `{text_cid}` entre {annee_debut} et {annee_fin}."));
-    }
-    let mut lines = vec![format!("**{} regroupement(s) pour `{text_cid}` ({annee_debut}–{annee_fin})**\n", regs.len())];
-    for rg in &regs {
-        let title_rg = rg["title"].as_str().unwrap_or("");
-        let vers     = rg["versions"].as_array().cloned().unwrap_or_default();
-        if !title_rg.is_empty() { lines.push(format!("\n### {title_rg}")); }
-        for v in &vers {
-            let debut = fmt_date(&v["dateDebut"]);
-            let fin   = fmt_date(&v["dateFin"]);
-            let vid   = v["id"].as_str().unwrap_or("");
-            let etat  = v["etat"].as_str().unwrap_or("");
-            let range = match (debut.is_empty(), fin.is_empty()) {
-                (false, false) => format!("{debut} → {fin}"),
-                (false, true)  => format!("{debut} → en vigueur"),
-                _              => String::new(),
-            };
-            lines.push(format!("- {range} *{etat}* `{vid}`"));
-        }
-    }
-    Ok(lines.join("\n"))
+    Ok(fmt_chrono(&data, id))
 }
 
 fn tool_eli_alias_texte() -> ToolDef {
@@ -935,17 +918,12 @@ fn tool_eli_alias_texte() -> ToolDef {
     }
 }
 async fn do_eli_alias_texte(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let eli  = require_str(args, "eli")?;
-    // CORRECTION vs référence : chemin /consult/eliAndAliasRedirectionTexte,
-    // body {idEliOrAlias}, pas /consult/getEliAlias {eli}.
-    let body = json!({ "idEliOrAlias": eli });
-    let data = client.post("/consult/eliAndAliasRedirectionTexte", body).await?;
-    let cid  = data["cid"].as_str().or_else(|| data["textCid"].as_str()).unwrap_or("");
-    if !cid.is_empty() {
-        Ok(format!("✅ L'ELI `{eli}` correspond au CID : `{cid}`"))
-    } else {
-        Ok(format!("Aucun texte trouvé pour l'ELI : `{eli}`"))
-    }
+    let eli = require_str(args, "eli")?;
+    let data = client.post("/consult/eliAndAliasRedirectionTexte", json!({ "idEliOrAlias": eli })).await?;
+    let cid = ["cid", "textCid", "id"].iter().map(|k| s(&data, k)).find(|x| !x.is_empty()).unwrap_or("");
+    if cid.is_empty() { return Ok(format!("Aucun texte trouvé pour l'ELI : `{eli}`")); }
+    let title = ["title", "titre"].iter().map(|k| s(&data, k)).find(|x| !x.is_empty()).unwrap_or("");
+    Ok(format!("✅ L'ELI `{eli}` correspond au texte `{cid}`{}", if title.is_empty() { String::new() } else { format!(" — {title}") }))
 }
 
 fn tool_versions_element() -> ToolDef {
@@ -963,28 +941,11 @@ fn tool_versions_element() -> ToolDef {
     }
 }
 async fn do_versions_element(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let text_cid    = require_str(args, "text_cid")?;
+    let text_cid = require_str(args, "text_cid")?;
     let element_cid = require_str(args, "element_cid")?;
     let body = json!({ "textCid": text_cid, "elementCid": element_cid });
     let data = client.post("/chrono/textCidAndElementCid", body).await?;
-    let regs = data["regroupements"].as_array().cloned().unwrap_or_default();
-    if regs.is_empty() {
-        return Ok(format!("Aucune version trouvée pour l'élément `{element_cid}`."));
-    }
-    let mut lines = vec![format!("**{} regroupement(s) pour `{element_cid}`**\n", regs.len())];
-    for rg in &regs {
-        let title_rg = rg["title"].as_str().unwrap_or("");
-        let vers     = rg["versions"].as_array().cloned().unwrap_or_default();
-        if !title_rg.is_empty() { lines.push(format!("\n### {title_rg}")); }
-        for v in &vers {
-            let debut = fmt_date(&v["dateDebut"]);
-            let fin   = fmt_date(&v["dateFin"]);
-            let vid   = v["id"].as_str().unwrap_or("");
-            let etat  = v["etat"].as_str().unwrap_or("");
-            lines.push(format!("- {debut} → {fin} *{etat}* `{vid}`"));
-        }
-    }
-    Ok(lines.join("\n"))
+    Ok(fmt_chrono(&data, element_cid))
 }
 
 // ============================================================================
@@ -1048,23 +1009,17 @@ fn tool_tables_annuelles() -> ToolDef {
     }
 }
 async fn do_tables_annuelles(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let annee_fin = int_arg(args, "annee_fin", 0);
-    if annee_fin == 0 { anyhow::bail!("annee_fin est obligatoire."); }
-    let mut body = json!({ "endYear": annee_fin });
-    let annee_debut = int_arg(args, "annee_debut", 0);
-    if annee_debut > 0 { body["startYear"] = json!(annee_debut); }
-    let data  = client.post("/consult/getTables", body).await?;
-    let items = data["tables"].as_array().cloned().unwrap_or_default();
-    if items.is_empty() {
-        return Ok(format!("Aucune table annuelle trouvée pour la période demandée."));
-    }
-    let mut lines = vec![format!("**{} table(s) annuelle(s)**\n", items.len())];
-    for t in &items {
-        let annee = t["annee"].as_i64().or_else(|| t["year"].as_i64()).unwrap_or(0);
-        let id    = t["id"].as_str().or_else(|| t["cid"].as_str()).unwrap_or("");
-        let mut line = format!("- **{annee}**");
-        if !id.is_empty() { line.push_str(&format!(" — `{id}`")); }
-        lines.push(line);
+    let end = int_arg(args, "annee_fin", int_arg(args, "annee", 0));
+    let end = if end == 0 { today()[..4].parse::<i64>().unwrap_or(2026) } else { end };
+    let start = int_arg(args, "annee_debut", end);
+    let data = client.post("/consult/getTables", json!({ "startYear": start, "endYear": end })).await?;
+    let tables = data["tables"].as_array().cloned().unwrap_or_default();
+    if tables.is_empty() { return Ok(format!("Aucune table annuelle pour {start}–{end}.")); }
+    let mut lines = vec![format!("**{} table(s) annuelle(s)** ({start}–{end})\n", tables.len())];
+    for tb in &tables {
+        let name = { let f = s(tb, "fileName"); if f.is_empty() { s(tb, "id") } else { f } };
+        let d = fmt_date(&tb["datePubli"]);
+        lines.push(format!("- {name}{}{} — `{}`{}", if d.is_empty() { String::new() } else { format!(" ({d})") }, if s(tb, "num").is_empty() { String::new() } else { format!(" n°{}", s(tb, "num")) }, s(tb, "id"), if s(tb, "pathToFile").is_empty() { String::new() } else { format!(" — {}", s(tb, "pathToFile")) }));
     }
     Ok(lines.join("\n"))
 }
@@ -1082,34 +1037,12 @@ fn tool_dates_sans_jo() -> ToolDef {
         }),
     }
 }
-async fn do_dates_sans_jo(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let annee = int_arg(args, "annee", 0);
-    // CORRECTION vs référence : /misc/datesWithoutJo est un GET sans aucun
-    // paramètre (pas de filtre par année côté API) — on filtre nous-mêmes
-    // le résultat si une année a été demandée.
-    let data  = client.get("/misc/datesWithoutJo").await?;
-    let mut dates: Vec<Value> = data["dates"].as_array()
-        .or_else(|| data["datesWithoutJo"].as_array())
-        .or_else(|| data.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if annee > 0 {
-        let prefix = annee.to_string();
-        dates.retain(|d| d.as_str().map(|s| s.starts_with(&prefix)).unwrap_or(false));
-    }
-    if dates.is_empty() {
-        return Ok(if annee > 0 {
-            format!("Aucune date sans JO trouvée pour {annee}.")
-        } else {
-            "Aucune date sans JO trouvée.".to_string()
-        });
-    }
-    let mut lines = vec![format!("**{} date(s) sans Journal Officiel**\n", dates.len())];
-    for d in &dates {
-        let s = d.as_str().unwrap_or("");
-        if !s.is_empty() { lines.push(format!("- {s}")); }
-    }
-    Ok(lines.join("\n"))
+async fn do_dates_sans_jo(_args: &Value, client: &LegifranceClient) -> Result<String> {
+    let data = client.get("/misc/datesWithoutJo").await?;
+    let dates = data["lstDateDisabled"].as_array().cloned().unwrap_or_default();
+    if dates.is_empty() { return Ok("Aucune date sans JO retournée.".into()); }
+    let list: Vec<String> = dates.iter().map(fmt_date).filter(|d| !d.is_empty()).collect();
+    Ok(format!("**{} date(s) sans Journal Officiel**\n\n{}", list.len(), list.join(", ")))
 }
 
 fn tool_annees_sans_table() -> ToolDef {
@@ -1121,20 +1054,11 @@ fn tool_annees_sans_table() -> ToolDef {
     }
 }
 async fn do_annees_sans_table(client: &LegifranceClient) -> Result<String> {
-    // NOTE : par cohérence avec /misc/datesWithoutJo (confirmé GET sans body
-    // par la référence), on suppose /misc/yearsWithoutTable de la même
-    // famille — non confirmé explicitement, à vérifier si ce outil échoue.
-    let data   = client.get("/misc/yearsWithoutTable").await?;
-    let annees = data["years"].as_array()
-        .or_else(|| data["annees"].as_array())
-        .or_else(|| data.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if annees.is_empty() { return Ok("Toutes les années ont une table annuelle disponible.".into()); }
-    let list: Vec<String> = annees.iter()
-        .filter_map(|a| a.as_i64().map(|n| n.to_string()))
-        .collect();
-    Ok(format!("**Années sans table annuelle** : {}", list.join(", ")))
+    let data = client.get("/misc/yearsWithoutTable").await?;
+    let ys = data["lstYearDisabled"].as_array().cloned().unwrap_or_default();
+    if ys.is_empty() { return Ok("Aucune année sans table annuelle.".into()); }
+    let list: Vec<String> = ys.iter().map(|y| y.as_i64().map(|n| n.to_string()).or_else(|| y.as_str().map(String::from)).unwrap_or_default()).collect();
+    Ok(format!("**{} année(s) sans table annuelle**\n\n{}", list.len(), list.join(", ")))
 }
 
 // ============================================================================
@@ -1142,11 +1066,15 @@ async fn do_annees_sans_table(client: &LegifranceClient) -> Result<String> {
 // ============================================================================
 
 fn tool_conventions() -> ToolDef {
-    ToolDef {
-        name: "legifrance_conventions".into(),
-        description: "Liste et recherche les conventions collectives disponibles dans Légifrance (fonds KALI).".into(),
-        input_schema: json!({ "type": "object", "required": [], "properties": { "query": { "type": "string", "description": "Recherche par titre de convention" }, "idcc": { "type": "string", "description": "Numéro IDCC exact" }, "taille": { "type": "integer", "description": "Nombre de résultats (défaut: 20)" } } }),
-    }
+    mk("legifrance_conventions",
+       "Liste paginée des conventions collectives (/list/conventions), filtrable par titre, IDCC ou état.",
+       json!({ "type": "object", "properties": {
+           "query":  { "type": "string", "description": "Texte recherché dans le titre" },
+           "idcc":   { "type": "string", "description": "Numéro IDCC (ex. 1486)" },
+           "statuts": { "type": "array", "items": { "type": "string" }, "description": "États juridiques (VIGUEUR, ABROGE…)" },
+           "page":   { "type": "integer", "minimum": 1, "default": 1 },
+           "taille": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+       }}))
 }
 fn tool_convention_par_idcc() -> ToolDef {
     ToolDef {
@@ -1162,27 +1090,14 @@ fn tool_convention_par_idcc() -> ToolDef {
 }
 async fn do_convention_par_idcc(args: &Value, client: &LegifranceClient) -> Result<String> {
     let idcc = require_str(args, "idcc")?;
-    // CORRECTION vs référence : POST /consult/kaliContIdcc attend {idcc}, pas {id}.
-    let body = json!({ "idcc": idcc });
-    let data = client.post("/consult/kaliContIdcc", body).await?;
-    let default_titre = format!("Convention IDCC {idcc}");
-    let titre  = data["titre"].as_str().unwrap_or(&default_titre);
-    let rid    = data["id"].as_str().unwrap_or("");
-    let num    = data["num"].as_str().unwrap_or("");
-    let nature = data["nature"].as_str().unwrap_or("");
-    let sects  = data["sections"].as_array().cloned().unwrap_or_default();
-    let mut lines = vec![format!("# {titre}\n"), format!("**IDCC** : {idcc}")];
-    if !rid.is_empty()    { lines.push(format!("**ID** : `{rid}`")); }
-    if !num.is_empty()    { lines.push(format!("**Numéro** : {num}")); }
-    if !nature.is_empty() { lines.push(format!("**Nature** : {nature}")); }
-    if !sects.is_empty() {
-        lines.push(format!("\n**{} section(s)**", sects.len()));
-        for s in sects.iter().take(10) {
-            let t = s["titre"].as_str().or_else(|| s["title"].as_str()).unwrap_or("");
-            if !t.is_empty() { lines.push(format!("  - {t}")); }
-        }
+    // KaliContConsultIdccRequest : champ obligatoire « id » (ID ou numéro IDCC).
+    let data = client.post("/consult/kaliContIdcc", json!({ "id": idcc })).await?;
+    let mut head = vec![format!("# {}\n", { let x = s(&data, "titre"); if x.is_empty() { idcc } else { x } })];
+    for (k, l) in [("num", "IDCC"), ("id", "ID"), ("nature", "Nature"), ("etat", "État")] {
+        let v = s(&data, k);
+        if !v.is_empty() { head.push(format!("**{l}** : {v}")); }
     }
-    Ok(lines.join("\n"))
+    Ok(format!("{}\n\n{}", head.join("\n"), fmt_toc_opts(&data, idcc, 4, false, 400)))
 }
 
 fn tool_convention_cont() -> ToolDef {
@@ -1205,30 +1120,9 @@ fn tool_convention_texte() -> ToolDef {
     }
 }
 async fn do_convention_texte(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "text_id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/consult/kaliText", body).await?;
-    let titre = data["title"].as_str().or_else(|| data["titre"].as_str()).unwrap_or(id);
-    let nor   = data["nor"].as_str().unwrap_or("");
-    let etat  = data["etat"].as_str().unwrap_or("");
-    let mut lines = vec![format!("# {titre}\n")];
-    if !nor.is_empty()  { lines.push(format!("**NOR** : {nor}")); }
-    if !etat.is_empty() { lines.push(format!("**État** : {etat}")); }
-    let articles = data["articles"].as_array()
-        .or_else(|| data["sections"].as_array())
-        .cloned()
-        .unwrap_or_default();
-    if !articles.is_empty() {
-        lines.push(format!("\n**{} article(s)/section(s)**\n", articles.len()));
-        for a in articles.iter().take(30) {
-            lines.push(fmt_article(a));
-            lines.push(String::new());
-        }
-        if articles.len() > 30 {
-            lines.push(format!("*… {} élément(s) supplémentaire(s)*", articles.len() - 30));
-        }
-    }
-    Ok(lines.join("\n"))
+    let id = require_any(args, &["id", "text_id"])?;
+    let data = client.post("/consult/kaliText", json!({ "id": id })).await?;
+    Ok(fmt_legi_text(&data, id))
 }
 
 fn tool_convention_article() -> ToolDef {
@@ -1254,12 +1148,17 @@ fn tool_jurisprudence() -> ToolDef {
     }
 }
 fn tool_jurisprudence_plan_classement() -> ToolDef {
-    ToolDef {
-        name: "legifrance_jurisprudence_plan_classement".into(),
-        description: "Consulte le plan de classement de la jurisprudence (arborescence thématique). \
-            Permet de naviguer dans les catégories de jurisprudence par thème ou matière.".into(),
-        input_schema: json!({ "type": "object", "required": ["query"], "properties": { "query": { "type": "string", "description": "Termes de recherche dans le plan de classement" }, "fond": { "type": "string", "description": "Fonds documentaire de jurisprudence" }, "niveau": { "type": "integer", "description": "Niveau hiérarchique" } } }),
-    }
+    mk("legifrance_jurisprudence_plan_classement",
+       "Navigue dans le plan de classement (JURINOME) de la jurisprudence : recherche par libellé ou par identifiant.",
+       json!({ "type": "object", "properties": {
+           "query":  { "type": "string", "description": "Libellé recherché" },
+           "id":     { "type": "string", "description": "Identifiant JURINOME (pour descendre dans l'arborescence)" },
+           "fond":   { "type": "string", "description": "Fond (ex. JURI, CETAT)" },
+           "niveau": { "type": "integer", "description": "Niveau courant dans l'arborescence" },
+           "page":   { "type": "integer", "minimum": 1, "default": 1 },
+           "par_niveau": { "type": "boolean", "default": false },
+           "suggestion": { "type": "boolean", "default": false }
+       }}))
 }
 fn tool_jurisprudence_ancien_id() -> ToolDef {
     ToolDef {
@@ -1274,21 +1173,9 @@ fn tool_jurisprudence_ancien_id() -> ToolDef {
     }
 }
 async fn do_jurisprudence_ancien_id(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "ancien_id")?;
-    let body = json!({ "oldId": id });
-    let data = client.post("/consult/getJuriByOldId", body).await?;
-    let txt = data["text"].as_array().and_then(|a| a.first()).cloned()
-        .unwrap_or_else(|| data["text"].clone());
-    let txt = if txt.is_null() { data.clone() } else { txt };
-    let titre = txt["titre"].as_str().or_else(|| txt["title"].as_str()).unwrap_or(id);
-    let raw   = txt["texteHtml"].as_str().or_else(|| txt["texte"].as_str()).unwrap_or("");
-    let texte = strip_html(raw);
-    let mut lines = vec![format!("# {titre}\n")];
-    if !texte.is_empty() {
-        let excerpt = if texte.len() > 5000 { &texte[..5000] } else { &texte };
-        lines.push(excerpt.to_string());
-    }
-    Ok(lines.join("\n"))
+    let id = require_any(args, &["ancien_id", "id"])?;
+    let data = client.post("/consult/getJuriWithAncienId", json!({ "ancienId": id })).await?;
+    Ok(fmt_texte_simple(data.get("text").unwrap_or(&data), id))
 }
 
 // ============================================================================
@@ -1315,21 +1202,9 @@ fn tool_cnil_ancien_id() -> ToolDef {
     }
 }
 async fn do_cnil_ancien_id(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "ancien_id")?;
-    let body = json!({ "oldId": id });
-    let data = client.post("/consult/getCnilByOldId", body).await?;
-    let txt = data["text"].as_array().and_then(|a| a.first()).cloned()
-        .unwrap_or_else(|| data["text"].clone());
-    let txt = if txt.is_null() { data.clone() } else { txt };
-    let titre = txt["titre"].as_str().or_else(|| txt["title"].as_str()).unwrap_or(id);
-    let raw   = txt["texteHtml"].as_str().or_else(|| txt["texte"].as_str()).unwrap_or("");
-    let texte = strip_html(raw);
-    let mut lines = vec![format!("# {titre}\n")];
-    if !texte.is_empty() {
-        let excerpt = if texte.len() > 5000 { &texte[..5000] } else { &texte };
-        lines.push(excerpt.to_string());
-    }
-    Ok(lines.join("\n"))
+    let id = require_any(args, &["ancien_id", "id"])?;
+    let data = client.post("/consult/getCnilWithAncienId", json!({ "ancienId": id })).await?;
+    Ok(fmt_texte_simple(data.get("text").unwrap_or(&data), id))
 }
 
 // ============================================================================
@@ -1360,18 +1235,12 @@ fn tool_dossier_legislatif() -> ToolDef {
     }
 }
 fn tool_lister_dossiers_legislatifs() -> ToolDef {
-    ToolDef {
-        name: "legifrance_lister_dossiers_legislatifs".into(),
-        description: "Liste les dossiers législatifs d'une législature donnée. \
-            Utilisez legifrance_lister_legislatures pour obtenir l'ID de législature.".into(),
-        input_schema: json!({
-            "type": "object", "required": ["legislature_id"],
-            "properties": {
-                "legislature_id": { "type": "integer", "description": "ID numérique de la législature (voir legifrance_lister_legislatures)" },
-                "type_dossier":   { "type": "string", "description": "Type de dossier (ex: LOI_PUBLIEE)" }
-            }
-        }),
-    }
+    mk("legifrance_lister_dossiers_legislatifs",
+       "Liste les dossiers législatifs d'une législature (voir legifrance_lister_legislatures pour les identifiants).",
+       json!({ "type": "object", "required": ["legislature_id"], "properties": {
+           "legislature_id": { "type": "integer", "description": "Identifiant de la législature" },
+           "type_dossier": { "type": "string", "enum": ["LOI_PUBLIEE", "ORDONNANCE_PUBLIEE", "PROJET_LOI", "PROPOSITION_LOI"], "default": "LOI_PUBLIEE" }
+       }}))
 }
 fn tool_lister_legislatures() -> ToolDef {
     ToolDef {
@@ -1421,32 +1290,9 @@ fn tool_debat() -> ToolDef {
     }
 }
 async fn do_debat(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "debat_id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/consult/debat", body).await?;
-    let deb = data["debat"].as_array().and_then(|a| a.first()).cloned()
-        .unwrap_or_else(|| data["debat"].clone());
-    let deb = if deb.is_null() { data.clone() } else { deb };
-    let date_s    = deb["dateSeance"].as_str().unwrap_or("");
-    let assemblee = deb["typeAssemblee"].as_str().unwrap_or("");
-    let legis     = deb["legislature"].as_str().map(|s| s.to_string())
-        .or_else(|| deb["legislature"].as_i64().map(|n| n.to_string()))
-        .unwrap_or_default();
-    let session   = deb["session"].as_str().unwrap_or("");
-    let rid       = deb["id"].as_str().unwrap_or(id);
-    let mut lines = vec![format!("# Débat parlementaire `{rid}`\n")];
-    if !date_s.is_empty()    { lines.push(format!("**Séance du** : {date_s}")); }
-    if !assemblee.is_empty() { lines.push(format!("**Assemblée** : {assemblee}")); }
-    if !legis.is_empty()     { lines.push(format!("**Législature** : {legis}")); }
-    if !session.is_empty()   { lines.push(format!("**Session** : {session}")); }
-    let raw   = deb["texteHtml"].as_str().or_else(|| deb["texte"].as_str()).unwrap_or("");
-    let texte = strip_html(raw);
-    if !texte.is_empty() {
-        lines.push(String::new());
-        let excerpt = if texte.len() > 5000 { &texte[..5000] } else { &texte };
-        lines.push(excerpt.to_string());
-    }
-    Ok(lines.join("\n"))
+    let id = require_any(args, &["id", "debat_id", "text_id"])?;
+    let data = client.post("/consult/debat", json!({ "id": id })).await?;
+    Ok(fmt_debat(data.get("debat").unwrap_or(&data), id))
 }
 
 fn tool_lister_debats_parlementaires() -> ToolDef {
@@ -1465,25 +1311,20 @@ fn tool_lister_debats_parlementaires() -> ToolDef {
     }
 }
 async fn do_lister_debats_parlementaires(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let mut body = json!({ "pageNumber": 1, "pageSize": int_arg(args, "nb_resultats", 20).clamp(1, 100) });
-    if let Some(types) = args["types_publication"].as_array() {
-        body["typesPublication"] = json!(types);
-    }
-    let date_p = str_arg(args, "date_parution");
-    if !date_p.is_empty() { body["dateParution"] = json!(date_p); }
-    let data  = client.post("/list/debatsParlementaires", body).await?;
+    let mut body = list_body(args, 20);
+    if let Some(types) = args["types_publication"].as_array() { body["typesPublication"] = json!(types); }
+    let dp = str_arg(args, "date_parution");
+    if !dp.is_empty() { body["dateParution"] = json!(dp); }
+    let data = client.post("/list/debatsParlementaires", body).await?;
     let items = data["results"].as_array().cloned().unwrap_or_default();
     if items.is_empty() { return Ok("Aucun débat parlementaire trouvé.".into()); }
-    let total = data["totalResultNumber"].as_i64().unwrap_or(items.len() as i64);
-    let mut lines = vec![format!("**{total} débat(s)** — {} affiché(s)\n", items.len())];
+    let mut lines = vec![format!("**{} débat(s)** — {} affiché(s)\n", total_of(&data, items.len()), items.len())];
     for d in &items {
-        let t   = d["titre"].as_str().or_else(|| d["title"].as_str()).unwrap_or("?");
-        let rid = d["id"].as_str().unwrap_or("");
-        let dt  = d["dateSeance"].as_str().or_else(|| d["dateParution"].as_str()).unwrap_or("");
-        let mut line = format!("- **{t}**");
-        if !dt.is_empty()  { line.push_str(&format!(" — {dt}")); }
-        if !rid.is_empty() { line.push_str(&format!(" — `{rid}`")); }
-        lines.push(line);
+        let dt = { let a = fmt_date(&d["dateSeance"]); if a.is_empty() { fmt_date(&d["dateParution"]) } else { a } };
+        let mut meta = vec![];
+        for k in ["typeAssemblee", "nomSession"] { if !s(d, k).is_empty() { meta.push(s(d, k).to_string()); } }
+        if let Some(l) = d["legislature"].as_i64() { meta.push(format!("législature {l}")); }
+        lines.push(format!("- {dt} — {} — `{}`", meta.join(" · "), s(d, "id")));
     }
     Ok(lines.join("\n"))
 }
@@ -1504,28 +1345,22 @@ fn tool_lister_questions_parlementaires() -> ToolDef {
     }
 }
 async fn do_lister_questions_parlementaires(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let mut body = json!({ "pageNumber": 1, "pageSize": int_arg(args, "nb_resultats", 20).clamp(1, 100) });
-    if let Some(types) = args["parlement_types"].as_array() {
-        // CORRECTION vs référence : le champ attendu est "parlementTypes".
-        body["parlementTypes"] = json!(types);
-    }
-    let periode = str_arg(args, "periode_publication");
-    if !periode.is_empty() { body["periodePublication"] = json!(periode); }
-    // CORRECTION vs référence : le chemin réel est
-    // /list/questionsEcritesParlementaires (pas /list/questionsParlementaires).
-    let data  = client.post("/list/questionsEcritesParlementaires", body).await?;
+    let mut body = list_body(args, 20);
+    if let Some(types) = args["parlement_types"].as_array() { body["parlementTypes"] = json!(types); }
+    let p = str_arg(args, "periode_publication");
+    if !p.is_empty() { body["periodePublication"] = json!(p); }
+    let data = client.post("/list/questionsEcritesParlementaires", body).await?;
     let items = data["results"].as_array().cloned().unwrap_or_default();
     if items.is_empty() { return Ok("Aucune question parlementaire trouvée.".into()); }
-    let total = data["totalResultNumber"].as_i64().unwrap_or(items.len() as i64);
-    let mut lines = vec![format!("**{total} question(s)** — {} affiché(s)\n", items.len())];
+    let mut lines = vec![format!("**{} question(s)** — {} affiché(s)\n", total_of(&data, items.len()), items.len())];
     for q in &items {
-        let t   = q["titre"].as_str().or_else(|| q["title"].as_str()).unwrap_or("?");
-        let rid = q["id"].as_str().unwrap_or("");
-        let dt  = q["datePublication"].as_str().unwrap_or("");
-        let mut line = format!("- **{t}**");
-        if !dt.is_empty()  { line.push_str(&format!(" — {dt}")); }
-        if !rid.is_empty() { line.push_str(&format!(" — `{rid}`")); }
-        lines.push(line);
+        let mut l = format!("- {}", fmt_date(&q["dateParution"]));
+        if !s(q, "emetteur").is_empty() { l.push_str(&format!(" — {}", s(q, "emetteur"))); }
+        if !s(q, "numeroParution").is_empty() { l.push_str(&format!(" — n°{}", s(q, "numeroParution"))); }
+        l.push_str(&format!(" — `{}`", s(q, "id")));
+        let f = { let x = s(q, "pdfName"); if x.is_empty() { s(q, "url") } else { x } };
+        if !f.is_empty() { l.push_str(&format!(" ({f})")); }
+        lines.push(l);
     }
     Ok(lines.join("\n"))
 }
@@ -1549,22 +1384,16 @@ fn tool_lister_bocc() -> ToolDef {
     }
 }
 async fn do_lister_bocc(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let mut body = json!({ "pageNumber": 1, "pageSize": int_arg(args, "nb_resultats", 20).clamp(1, 100) });
-    let interval = str_arg(args, "interval_publication");
-    if !interval.is_empty() { body["intervalPublication"] = json!(interval); }
-    let data  = client.post("/list/bocc", body).await?;
+    let mut body = list_body(args, 20);
+    let iv = str_arg(args, "interval_publication");
+    if !iv.is_empty() { body["intervalPublication"] = json!(iv); }
+    let data = client.post("/list/bocc", body).await?;
     let items = data["results"].as_array().cloned().unwrap_or_default();
     if items.is_empty() { return Ok("Aucun BOCC trouvé.".into()); }
-    let total = data["totalResultNumber"].as_i64().unwrap_or(items.len() as i64);
-    let mut lines = vec![format!("**{total} BOCC** — {} affiché(s)\n", items.len())];
+    let mut lines = vec![format!("**{} BOCC** — {} affiché(s)\n", total_of(&data, items.len()), items.len())];
     for b in &items {
-        let rid  = b["id"].as_str().unwrap_or("");
-        let glob = b["globalTitle"].as_str().or_else(|| b["titre"].as_str()).unwrap_or("");
-        let date = b["datePublication"].as_str().unwrap_or("");
-        let mut line = if !glob.is_empty() { format!("- **{glob}**") } else { "- BOCC".to_string() };
-        if !date.is_empty() { line.push_str(&format!(" — {date}")); }
-        if !rid.is_empty()  { line.push_str(&format!(" — `{rid}`")); }
-        lines.push(line);
+        let g = &b["globalBocc"];
+        lines.push(format!("- BOCC n°{} du {} — `{}` {}", s(g, "numParution"), fmt_date(&g["dateParution"]), s(b, "id"), s(g, "fileName")));
     }
     Ok(lines.join("\n"))
 }
@@ -1585,26 +1414,17 @@ fn tool_lister_bocc_textes() -> ToolDef {
     }
 }
 async fn do_lister_bocc_textes(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let mut body = json!({ "pageNumber": 1, "pageSize": int_arg(args, "nb_resultats", 20).clamp(1, 100) });
-    let bocc_id = str_arg(args, "bocc_id");
-    if !bocc_id.is_empty() { body["idMainBocc"] = json!(bocc_id); }
-    if let Some(idccs) = args["idccs"].as_array() { body["idccs"] = json!(idccs); }
-    let data  = client.post("/list/boccTexts", body).await?;
-    let items = data["texts"].as_array()
-        .or_else(|| data["results"].as_array())
-        .cloned()
-        .unwrap_or_default();
+    let mut body = list_body(args, 20);
+    let bid = str_arg(args, "bocc_id");
+    if !bid.is_empty() { body["idMainBocc"] = json!(bid); }
+    if let Some(i) = args["idccs"].as_array() { body["idccs"] = json!(i); }
+    let data = client.post("/list/boccTexts", body).await?;
+    let items = data["texts"].as_array().cloned().unwrap_or_default();
     if items.is_empty() { return Ok("Aucun texte BOCC trouvé.".into()); }
-    let total = data["totalResultNumber"].as_i64().unwrap_or(items.len() as i64);
-    let mut lines = vec![format!("**{total} texte(s) BOCC** — {} affiché(s)\n", items.len())];
+    let mut lines = vec![format!("**{} texte(s) BOCC** — {} affiché(s)\n", total_of(&data, items.len()), items.len())];
     for t in &items {
-        let titre = t["titre"].as_str().or_else(|| t["title"].as_str()).unwrap_or("?");
-        let id    = t["id"].as_str().or_else(|| t["cid"].as_str()).unwrap_or("");
-        let idcc  = t["idcc"].as_str().unwrap_or("");
-        let mut line = format!("- **{titre}**");
-        if !idcc.is_empty() { line.push_str(&format!(" (IDCC {idcc})")); }
-        if !id.is_empty()   { line.push_str(&format!(" — `{id}`")); }
-        lines.push(line);
+        let idcc: Vec<&str> = t["idccs"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+        lines.push(format!("- **{}**{} — {} — BOCC `{}` ({})", s(t, "title"), if idcc.is_empty() { String::new() } else { format!(" (IDCC {})", idcc.join(", ")) }, fmt_date(&t["texteDate"]), s(t, "idMainBocc"), s(t, "fileName")));
     }
     Ok(lines.join("\n"))
 }
@@ -1625,24 +1445,22 @@ fn tool_lister_boccs_et_textes() -> ToolDef {
     }
 }
 async fn do_lister_boccs_et_textes(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let mut body = json!({ "pageNumber": 1, "pageSize": int_arg(args, "nb_resultats", 20).clamp(1, 100) });
-    let idcc     = str_arg(args, "idcc");
-    let titre    = str_arg(args, "titre");
-    let interval = str_arg(args, "interval_publication");
-    // CORRECTION vs référence : le schéma officiel attend "idccs" (tableau),
-    // pas "idcc" (scalaire) — un champ inconnu fait planter l'API en 500.
-    if !idcc.is_empty()     { body["idccs"]               = json!([idcc]); }
-    if !titre.is_empty()    { body["titre"]               = json!(titre); }
-    if !interval.is_empty() { body["intervalPublication"] = json!(interval); }
-    let data  = client.post("/list/boccsAndTexts", body).await?;
+    let mut body = list_body(args, 20);
+    // BoccAndTextListRequest : « idcc » est un scalaire (et non « idccs »).
+    let (idcc, titre, iv) = (str_arg(args, "idcc"), str_arg(args, "titre"), str_arg(args, "interval_publication"));
+    if !idcc.is_empty() { body["idcc"] = json!(idcc); }
+    if !titre.is_empty() { body["titre"] = json!(titre); }
+    if !iv.is_empty() { body["intervalPublication"] = json!(iv); }
+    let data = client.post("/list/boccsAndTexts", body).await?;
     let items = data["results"].as_array().cloned().unwrap_or_default();
     if items.is_empty() { return Ok("Aucun résultat BOCC/texte trouvé.".into()); }
-    let total = data["totalResultNumber"].as_i64().unwrap_or(items.len() as i64);
-    let mut lines = vec![format!("**{total} résultat(s)** — {} affiché(s)\n", items.len())];
+    let mut lines = vec![format!("**{} résultat(s)** — {} affiché(s)\n", total_of(&data, items.len()), items.len())];
     for r in &items {
-        let titre = r["titre"].as_str().or_else(|| r["title"].as_str()).unwrap_or("?");
-        let id    = r["id"].as_str().or_else(|| r["cid"].as_str()).unwrap_or("");
-        lines.push(format!("- **{titre}**{}", if id.is_empty() { String::new() } else { format!(" — `{id}`") }));
+        let g = &r["globalBocc"];
+        lines.push(format!("- BOCC n°{} du {} — `{}`", s(g, "numParution"), fmt_date(&g["dateParution"]), s(r, "id")));
+        for tx in r["texts"].as_array().map(|a| a.iter().take(5).collect::<Vec<_>>()).unwrap_or_default() {
+            lines.push(format!("  ↳ {}", s(tx, "title")));
+        }
     }
     Ok(lines.join("\n"))
 }
@@ -1694,22 +1512,18 @@ fn tool_lister_bodmr() -> ToolDef {
     }
 }
 async fn do_lister_bodmr(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let mut body = json!({ "pageNumber": 1, "pageSize": int_arg(args, "nb_resultats", 20).clamp(1, 100) });
-    let annee = int_arg(args, "annee", 0);
-    if annee > 0 { body["year"] = json!(annee); }
-    let data  = client.post("/list/bodmr", body).await?;
+    let mut body = list_body(args, 20);
+    let a = int_arg(args, "annee", 0);
+    if a > 0 { body["years"] = json!([a.to_string()]); }
+    let data = client.post("/list/bodmr", body).await?;
+    let metas = data["pdfMetadatas"].as_array().cloned().unwrap_or_default();
     let items = data["results"].as_array().cloned().unwrap_or_default();
-    if items.is_empty() { return Ok("Aucun BODMR trouvé.".into()); }
-    let total = data["totalResultNumber"].as_i64().unwrap_or(items.len() as i64);
-    let mut lines = vec![format!("**{total} BODMR** — {} affiché(s)\n", items.len())];
-    for b in &items {
-        let titre   = b["titre"].as_str().or_else(|| b["title"].as_str()).unwrap_or("Sans titre");
-        let annee_b = b["annee"].as_i64().or_else(|| b["year"].as_i64()).unwrap_or(0);
-        let id      = b["id"].as_str().unwrap_or("");
-        let mut line = format!("- **{titre}**");
-        if annee_b > 0    { line.push_str(&format!(" ({annee_b})")); }
-        if !id.is_empty() { line.push_str(&format!(" — `{id}`")); }
-        lines.push(line);
+    if metas.is_empty() && items.is_empty() { return Ok("Aucun BODMR trouvé.".into()); }
+    let mut lines = vec![format!("**{} BODMR**\n", total_of(&data, items.len().max(metas.len())))];
+    if !metas.is_empty() {
+        for m in &metas { lines.push(format!("- {} ({}) — `{}`", s(m, "fileName"), fmt_date(&m["datePubli"]), s(m, "id"))); }
+    } else {
+        for b in &items { lines.push(format!("- `{}`", s(b, "id"))); }
     }
     Ok(lines.join("\n"))
 }
@@ -1733,19 +1547,21 @@ fn tool_lister_docs_admins() -> ToolDef {
 }
 async fn do_lister_docs_admins(args: &Value, client: &LegifranceClient) -> Result<String> {
     let mut body = json!({});
-    if let Some(annees) = args["annees"].as_array() { body["years"] = json!(annees); }
-    let data  = client.post("/list/docsAdmins", body).await?;
+    // DocsAdminsListRequest.years : tableau de CHAÎNES.
+    if let Some(an) = args["annees"].as_array() {
+        body["years"] = json!(an.iter().map(|y| y.as_i64().map(|n| n.to_string()).or_else(|| y.as_str().map(String::from)).unwrap_or_default()).collect::<Vec<_>>());
+    }
+    let data = client.post("/list/docsAdmins", body).await?;
     let items = data["results"].as_array().cloned().unwrap_or_default();
     if items.is_empty() { return Ok("Aucun document administratif trouvé.".into()); }
-    let mut lines = vec![format!("**{} document(s) administratif(s)**\n", items.len())];
+    let mut lines = vec![format!("**{} document(s) administratif(s)**\n", total_of(&data, items.len()))];
     for d in &items {
-        let titre = d["titre"].as_str().or_else(|| d["title"].as_str()).unwrap_or("Sans titre");
-        let annee = d["annee"].as_i64().or_else(|| d["year"].as_i64()).unwrap_or(0);
-        let id    = d["id"].as_str().unwrap_or("");
-        let mut line = format!("- **{titre}**");
-        if annee > 0      { line.push_str(&format!(" ({annee})")); }
-        if !id.is_empty() { line.push_str(&format!(" — `{id}`")); }
-        lines.push(line);
+        let mut l = format!("- **{}**", { let x = s(d, "titre"); if x.is_empty() { "Sans titre" } else { x } });
+        if !s(d, "nature").is_empty() { l.push_str(&format!(" [{}]", s(d, "nature"))); }
+        let dt = fmt_date(&d["dateDocument"]);
+        if !dt.is_empty() { l.push_str(&format!(" — {dt}")); }
+        l.push_str(&format!(" — `{}`", s(d, "id")));
+        lines.push(l);
     }
     Ok(lines.join("\n"))
 }
@@ -1764,72 +1580,69 @@ fn tool_commit_id() -> ToolDef {
 }
 async fn do_commit_id(client: &LegifranceClient) -> Result<String> {
     let data = client.get("/misc/commitId").await?;
-    let cid  = data["commitId"].as_str()
-        .or_else(|| data["commit_id"].as_str())
-        .or_else(|| data["content"].as_str())
-        .unwrap_or("(inconnu)");
-    Ok(format!("**Commit ID de l'API Légifrance** : `{cid}`"))
+    let lines = kv_lines(&data);
+    if lines.is_empty() { return Ok(format!("Réponse : {data}")); }
+    Ok(format!("**Version de l'API Légifrance**\n\n{}", lines.join("\n")))
 }
 
 async fn do_code_toc(args: &Value, client: &LegifranceClient) -> Result<String> {
     let code = require_str(args, "code")?;
-    let code_id = resolve_code(code)?;
+    let text_id = resolve_code_dyn(client, code).await?;
     let date = date_arg(args, "date", &today());
-    // CORRECTION vs référence : /consult/code/tableMatieres attend {textId},
-    // pas {sctCid}.
-    let body = json!({ "textId": code_id, "date": date });
-    let data = client.post("/consult/code/tableMatieres", body).await?;
-    Ok(fmt_toc(&data, code))
+    // /consult/code/tableMatieres est déprécié → /consult/legi/tableMatieres.
+    let body = json!({ "textId": text_id, "date": date, "nature": "CODE" });
+    let data = client.post("/consult/legi/tableMatieres", body).await?;
+    let depth = int_arg(args, "profondeur", 4).clamp(1, 10) as usize;
+    let with_art = args["inclure_articles"].as_bool().unwrap_or(false);
+    Ok(fmt_toc_opts(&data, code, depth, with_art, 800))
 }
 
 async fn do_code_article(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let date = date_arg(args, "date", &today());
-    let body = json!({ "id": id, "date": date });
-    let data = client.post("/consult/getArticle", body).await?;
-    let article = &data["article"];
-    if article.is_null() { return Ok(format!("Article `{id}` introuvable.")); }
-    Ok(fmt_article(article))
+    let id = require_any(args, &["id", "article_id"])?;
+    let data = client.post("/consult/getArticle", json!({ "id": id })).await?;
+    let a = data.get("article").unwrap_or(&data);
+    if a.is_null() { anyhow::bail!("Article introuvable : {id}"); }
+    Ok(fmt_article(a))
 }
 
 async fn do_code_section(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    // CORRECTION vs référence : le chemin /consult/code/section n'existe pas.
-    // L'endpoint générique correct est /consult/getSectionByCid { cid }.
-    let body = json!({ "cid": id });
-    let data = client.post("/consult/getSectionByCid", body).await?;
-    fmt_section_result(&data, id)
+    let id = require_any(args, &["id", "cid"])?;
+    let data = client.post("/consult/getSectionByCid", json!({ "cid": id })).await?;
+    Ok(fmt_list_section(&data, id))
 }
 
 async fn do_code_article_by_num(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let code   = require_str(args, "code")?;
-    let numero = require_str(args, "numero")?;
-    let code_id = resolve_code(code)?;
-    // CORRECTION vs référence : /consult/code/articleNum n'existe pas.
-    // L'endpoint correct est /consult/getArticleWithIdAndNum { id, num }.
-    let body   = json!({ "id": code_id, "num": numero });
-    let data   = client.post("/consult/getArticleWithIdAndNum", body).await?;
-    let article = data["article"].as_array()
-        .and_then(|a| a.first())
-        .unwrap_or(&data["article"]);
-    if article.is_null() { return Ok(format!("Article {numero} introuvable dans le code {code}.")); }
-    Ok(fmt_article(article))
+    let code = require_str(args, "code")?;
+    let numero = normalize_article_num(require_str(args, "numero")?);
+    let id = resolve_code_dyn(client, code).await?;
+    let data = client.post("/consult/getArticleWithIdAndNum", json!({ "id": id, "num": numero })).await?;
+    let a = data.get("article").unwrap_or(&data);
+    if a.is_null() || (a.is_object() && a.as_object().map(|o| o.is_empty()).unwrap_or(false)) {
+        anyhow::bail!("Article '{numero}' introuvable dans {code} (version en vigueur).");
+    }
+    let date = str_arg(args, "date");
+    if date.is_empty() { return Ok(fmt_article(a)); }
+    let v = article_at_date(client, a, date).await?;
+    Ok(fmt_article(&v))
 }
 
 async fn do_code_article_versions(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/consult/getArticleVersions", body).await?;
-    fmt_versions(&data, id)
+    let id = require_any(args, &["id", "cid"])?;
+    // Opération dédiée : /consult/getArticleByCid → listArticle.
+    let data = client.post("/consult/getArticleByCid", json!({ "cid": id })).await?;
+    let mut versions = data["listArticle"].as_array().cloned().unwrap_or_default();
+    if versions.is_empty() {
+        // Repli : Article.articleVersions renvoyé par getArticle.
+        let d = client.post("/consult/getArticle", json!({ "id": id })).await?;
+        versions = d["article"]["articleVersions"].as_array().cloned().unwrap_or_default();
+    }
+    Ok(fmt_article_versions(&versions, id))
 }
 
 async fn do_code_article_liens(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    // CORRECTION vs référence : chemin /consult/concordanceLinksArticle,
-    // body {articleId}, pas /consult/getArticleLinks {id, typeLinks}.
-    let body = json!({ "articleId": id });
-    let data = client.post("/consult/concordanceLinksArticle", body).await?;
-    fmt_liens(&data, id)
+    let id = require_any(args, &["id", "article_id"])?;
+    let data = client.post("/consult/concordanceLinksArticle", json!({ "articleId": id })).await?;
+    Ok(fmt_revision_links(&data, id, "Liens de concordance"))
 }
 
 async fn do_code_list(_args: &Value, client: &LegifranceClient) -> Result<String> {
@@ -1856,63 +1669,42 @@ async fn do_code_list(_args: &Value, client: &LegifranceClient) -> Result<String
 // ============================================================================
 
 async fn do_legi_text(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let date = date_arg(args, "date", &today());
-    // CORRECTION vs référence : pour le texte complet d'une loi/décret, c'est
-    // /consult/legiPart { textId, date } (LegiConsultRequest) qu'il faut
-    // appeler — /consult/legi/tableMatieres ne retourne qu'un sommaire, et
-    // attend de toute façon {textId} et non {id}.
-    let body = json!({ "textId": id, "date": date });
-    let data = client.post("/consult/legiPart", body).await?;
-    let titre = data["titre"].as_str().or_else(|| data["title"].as_str()).unwrap_or(id);
-    let nature = data["nature"].as_str().unwrap_or("");
-    let etat   = data["etat"].as_str().unwrap_or("");
-    let dv = fmt_date(&data["dateVigueur"]);
-    let dp = fmt_date(&data["datePublication"]);
-    let mut lines = vec![format!("# {titre}\n")];
-    if !nature.is_empty() { lines.push(format!("**Nature** : {nature}")); }
-    if !etat.is_empty()   { lines.push(format!("**État** : {etat}")); }
-    if !dv.is_empty()     { lines.push(format!("**Date de vigueur** : {dv}")); }
-    if !dp.is_empty()     { lines.push(format!("**Date de publication** : {dp}")); }
-    lines.push(format!("**ID** : `{id}`\n"));
-    lines.push(fmt_toc(&data, titre));
-    Ok(lines.join("\n"))
+    let id = require_any(args, &["id", "text_id"])?;
+    let data = if id.starts_with("JORFTEXT") {
+        client.post("/consult/jorf", json!({ "textCid": id })).await?
+    } else {
+        let body = json!({ "textId": id, "date": date_arg(args, "date", &today()) });
+        match client.post("/consult/lawDecree", body.clone()).await {
+            Ok(d) => d,
+            Err(_) => client.post("/consult/legiPart", body).await?,
+        }
+    };
+    if args["sommaire_seulement"].as_bool().unwrap_or(false) { return Ok(fmt_toc(&data, id)); }
+    Ok(fmt_legi_text(&data, id))
 }
 
 async fn do_legi_section(args: &Value, client: &LegifranceClient) -> Result<String> {
-    do_code_section(args, client).await
+    let id = require_any(args, &["id", "text_id"])?;
+    let body = json!({ "textId": id, "date": date_arg(args, "date", &today()) });
+    let data = client.post("/consult/legiPart", body).await?;
+    Ok(fmt_legi_text(&data, id))
 }
 
 async fn do_search_all(args: &Value, client: &LegifranceClient) -> Result<String> {
     let query = require_str(args, "query")?;
-    let body  = build_search_body(args, "ALL");
-    let data  = client.post("/search", body).await?;
+    let body = build_search_body(args, "ALL")?;
+    let data = client.post("/search", body).await?;
     Ok(fmt_search(&data, query))
 }
 
 async fn do_search_suggest(args: &Value, client: &LegifranceClient) -> Result<String> {
     let query = require_str(args, "query")?;
-    let fond  = str_arg(args, "fond");
-    // CORRECTION vs référence PISTE : l'endpoint POST /suggest attend un
-    // SuggestSupplyRequest { searchText, supplies: [...] }, pas { query, fond }.
-    let supplies = if fond.is_empty() { vec!["ALL_SUGGEST".to_string()] } else { vec![fond.to_string()] };
-    let body  = json!({ "searchText": query, "supplies": supplies });
-    let data  = client.post("/suggest", body).await?;
-    let results = data["suggestions"].as_array()
-        .or_else(|| data["results"].as_array())
-        .or_else(|| data.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if results.is_empty() { return Ok(format!("Aucune suggestion pour : « {query} »")); }
-    let mut lines = vec![format!("**Suggestions pour « {query} »** :\n")];
-    for r in results.iter().take(20) {
-        let r_str = r.to_string();
-        let title = r["title"].as_str().or_else(|| r["titre"].as_str()).unwrap_or(&r_str);
-        let id    = r["id"].as_str().or_else(|| r["cid"].as_str()).unwrap_or("");
-        lines.push(format!("- {title}{}",
-            if id.is_empty() { String::new() } else { format!(" — `{id}`") }));
-    }
-    Ok(lines.join("\n"))
+    const SUPPLIES: &[&str] = &["ALL","JORF","CNIL","CETAT","JURI","JUFI","CONSTIT","KALI","CODE_DATE","CODE_ETAT","LODA_DATE","LODA_ETAT","CIRC","ACCO"];
+    let f = norm_fond(str_arg(args, "fond"))?;
+    let supply = if SUPPLIES.contains(&f.as_str()) { f } else { "ALL".to_string() };
+    let body = json!({ "searchText": query, "supplies": [supply] });
+    let data = client.post("/suggest", body).await?;
+    Ok(fmt_suggest(&data, query, ""))
 }
 
 // ============================================================================
@@ -1920,91 +1712,81 @@ async fn do_search_suggest(args: &Value, client: &LegifranceClient) -> Result<St
 // ============================================================================
 
 async fn do_jorf_text(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/consult/jorf", body).await?;
-    fmt_jorf_text_result(&data, id)
+    let id = require_any(args, &["id", "text_cid", "textCid"])?;
+    // JorfConsultRequest : champ obligatoire textCid (et non « id »).
+    let data = client.post("/consult/jorf", json!({ "textCid": id })).await?;
+    Ok(fmt_legi_text(&data, id))
 }
 
 async fn do_jorf_article(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/consult/jorf/article", body).await?;
-    let article = data.get("article").unwrap_or(&data);
-    Ok(fmt_article(article))
+    let nor = require_any(args, &["nor", "id"])?;
+    if nor.starts_with("JORFTEXT") {
+        let d = client.post("/consult/jorf", json!({ "textCid": nor })).await?;
+        return Ok(fmt_legi_text(&d, nor));
+    }
+    let data = client.post("/consult/getJoWithNor", json!({ "nor": nor })).await?;
+    Ok(fmt_legi_text(&data, nor))
 }
 
 async fn do_jorf_section(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/consult/jorf/section", body).await?;
-    fmt_section_result(&data, id)
+    let id = require_any(args, &["id", "text_cid", "textCid"])?;
+    let data = client.post("/consult/jorfPart", json!({ "textCid": id })).await?;
+    Ok(fmt_legi_text(&data, id))
 }
 
 async fn do_jorf_jo_list(args: &Value, client: &LegifranceClient) -> Result<String> {
-    // CORRECTION : /consult/jorf/listJo n'existe pas dans l'API Légifrance —
-    // c'est très probablement la cause des erreurs 403 observées (une route
-    // non enregistrée renvoie 403 côté passerelle PISTE plutôt que 404).
-    // Le bon point d'entrée pour « les N derniers JO » est /consult/lastNJo,
-    // qui prend un simple nbElement (pas de pagination ni de période — pour
-    // une période précise, voir legifrance_sommaire_jorf / /consult/jorfCont).
-    let nb = int_arg(args, "taille", 10);
-    let body = json!({ "nbElement": nb });
-    let data = client.post("/consult/lastNJo", body).await?;
+    let n = int_arg(args, "nb_elements", int_arg(args, "nb", 10)).clamp(1, 2499);
+    let data = client.post("/consult/lastNJo", json!({ "nbElement": n })).await?;
     fmt_jo_list(&data)
 }
 
 async fn do_kali_list(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let body = json!({
-        "query":      str_arg(args, "query"),
-        "pageNumber": int_arg(args, "page", 1),
-        "pageSize":   int_arg(args, "taille", 20)
-    });
-    let data = client.post("/list/kali", body).await?;
+    let mut body = json!({ "pageNumber": int_arg(args, "page", 1).max(1), "pageSize": int_arg(args, "taille", 20).clamp(1, 100) });
+    let q = str_arg(args, "query");
+    if !q.is_empty() { body["titre"] = json!(q); }
+    let idcc = str_arg(args, "idcc");
+    if !idcc.is_empty() { body["idcc"] = json!(idcc); }
+    if let Some(st) = args["statuts"].as_array() { body["legalStatus"] = json!(st); }
+    let data = client.post("/list/conventions", body).await?;
     let results = data["results"].as_array().cloned().unwrap_or_default();
     if results.is_empty() { return Ok("Aucune convention collective trouvée.".into()); }
-    let total = data["totalResultNumber"].as_i64().unwrap_or(results.len() as i64);
-    let mut lines = vec![format!("**{total} convention(s) collective(s)**\n")];
+    let mut lines = vec![format!("**{} convention(s) collective(s)**\n", total_of(&data, results.len()))];
     for r in &results {
-        let titre = r["title"].as_str().or_else(|| r["titre"].as_str()).unwrap_or("?");
-        let id    = r["id"].as_str().or_else(|| r["cid"].as_str()).unwrap_or("");
-        let idcc  = r["idcc"].as_str().or_else(|| r["numero"].as_str()).unwrap_or("");
-        let idcc_str = if !idcc.is_empty() { format!(" (IDCC {idcc})") } else { String::new() };
-        lines.push(format!("- **{titre}**{idcc_str}"));
-        if !id.is_empty() { lines.push(format!("  `{id}`")); }
+        let idcc = s(r, "idcc");
+        lines.push(format!("- **{}**{}{}", { let x = s(r, "titre"); if x.is_empty() { "?" } else { x } },
+            if idcc.is_empty() { String::new() } else { format!(" (IDCC {idcc})") },
+            if s(r, "etat").is_empty() { String::new() } else { format!(" [{}]", s(r, "etat")) }));
+        let (id, cont) = (s(r, "id"), s(r, "cidConteneur"));
+        if !id.is_empty() || !cont.is_empty() {
+            lines.push(format!("  texte de base `{id}` — conteneur `{cont}`"));
+        }
     }
     Ok(lines.join("\n"))
 }
 
 async fn do_kali_text(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    // CORRECTION vs référence : le chemin /consult/kali/tableMatieres
-    // n'existe pas. Le conteneur d'une convention se consulte via
-    // /consult/kaliCont { id } (KaliContConsultRequest, sans date).
-    let body = json!({ "id": id });
-    let data = client.post("/consult/kaliCont", body).await?;
-    let titre = data["titre"].as_str().or_else(|| data["title"].as_str()).unwrap_or(id);
-    Ok(fmt_toc(&data, titre))
+    let id = require_any(args, &["id", "cid"])?;
+    let data = client.post("/consult/kaliCont", json!({ "id": id })).await?;
+    let mut head = vec![format!("# {}\n", { let x = s(&data, "titre"); if x.is_empty() { id } else { x } })];
+    for (k, l) in [("num", "IDCC"), ("id", "ID"), ("etat", "État")] {
+        let v = s(&data, k);
+        if !v.is_empty() { head.push(format!("**{l}** : {v}")); }
+    }
+    Ok(format!("{}\n\n{}", head.join("\n"), fmt_toc_opts(&data, id, 4, false, 400)))
 }
 
 async fn do_kali_article(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    // CORRECTION vs référence : un article KALI se consulte via
-    // /consult/kaliArticle { id } (KaliTextConsultArticleRequest), pas
-    // /consult/getArticle (générique, réservé aux articles LEGIARTI/JORFARTI).
-    let body = json!({ "id": id });
-    let data = client.post("/consult/kaliArticle", body).await?;
-    let article = data.get("article").unwrap_or(&data);
-    Ok(fmt_article(article))
+    let id = require_any(args, &["id", "article_id"])?;
+    let data = client.post("/consult/kaliArticle", json!({ "id": id })).await?;
+    // ConsultKaliTextResponse / article : tente l'objet article direct, sinon la structure.
+    if data["article"].is_object() { return Ok(fmt_article(&data["article"])); }
+    Ok(fmt_legi_text(&data, id))
 }
 
 async fn do_kali_section(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    // CORRECTION vs référence : le chemin /consult/kali/section n'existe pas.
-    // Une section KALI se consulte via /consult/kaliSection { id }.
-    let body = json!({ "id": id });
-    let data = client.post("/consult/kaliSection", body).await?;
-    fmt_section_result(&data, id)
+    let id = require_any(args, &["id", "cid"])?;
+    let data = client.post("/consult/kaliSection", json!({ "id": id })).await?;
+    Ok(fmt_legi_text(&data, id))
 }
 
 // ============================================================================
@@ -2012,11 +1794,9 @@ async fn do_kali_section(args: &Value, client: &LegifranceClient) -> Result<Stri
 // ============================================================================
 
 async fn do_cnil_text(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    // CORRECTION vs référence : POST /consult/cnil attend {textId}, pas {id}.
-    let body = json!({ "textId": id });
-    let data = client.post("/consult/cnil", body).await?;
-    fmt_generic_text(&data, id)
+    let id = require_any(args, &["id", "text_id"])?;
+    let data = client.post("/consult/cnil", json!({ "textId": id })).await?;
+    Ok(fmt_texte_simple(data.get("text").unwrap_or(&data), id))
 }
 
 // ============================================================================
@@ -2024,10 +1804,9 @@ async fn do_cnil_text(args: &Value, client: &LegifranceClient) -> Result<String>
 // ============================================================================
 
 async fn do_acco_text(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/consult/acco", body).await?;
-    fmt_generic_text(&data, id)
+    let id = require_any(args, &["id", "text_id"])?;
+    let data = client.post("/consult/acco", json!({ "id": id })).await?;
+    Ok(fmt_acco(data.get("acco").unwrap_or(&data), id))
 }
 
 // ============================================================================
@@ -2035,11 +1814,9 @@ async fn do_acco_text(args: &Value, client: &LegifranceClient) -> Result<String>
 // ============================================================================
 
 async fn do_circ_text(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let body = json!({ "id": id });
-    // CORRECTION vs référence : le chemin réel est /consult/circulaire.
-    let data = client.post("/consult/circulaire", body).await?;
-    fmt_generic_text(&data, id)
+    let id = require_any(args, &["id", "text_id"])?;
+    let data = client.post("/consult/circulaire", json!({ "id": id })).await?;
+    Ok(fmt_circulaire(data.get("circulaire").unwrap_or(&data), id))
 }
 
 // ============================================================================
@@ -2047,34 +1824,24 @@ async fn do_circ_text(args: &Value, client: &LegifranceClient) -> Result<String>
 // ============================================================================
 
 async fn do_lister_dossiers_legislatifs(args: &Value, client: &LegifranceClient) -> Result<String> {
-    // CORRECTION vs référence : le listing des dossiers législatifs se fait
-    // via /list/dossiersLegislatifs { type, legislatureId }, pas via /search
-    // avec un fond "DOSSIER_LEGISLATIF" qui n'existe pas dans l'API.
-    let legislature_id = int_arg(args, "legislature_id", 0);
-    if legislature_id == 0 { anyhow::bail!("legislature_id est obligatoire."); }
-    let type_dossier = str_arg(args, "type_dossier");
-    let type_dossier = if type_dossier.is_empty() { "LOI_PUBLIEE" } else { type_dossier };
-    let body = json!({ "type": type_dossier, "legislatureId": legislature_id });
-    let data = client.post("/list/dossiersLegislatifs", body).await?;
-    let items = data["results"].as_array()
-        .or_else(|| data["dossiers"].as_array())
-        .cloned()
-        .unwrap_or_default();
-    if items.is_empty() { return Ok(format!("Aucun dossier législatif trouvé pour la législature {legislature_id}.")); }
-    let mut lines = vec![format!("**{} dossier(s) législatif(s)** — législature {legislature_id}\n", items.len())];
-    for d in &items {
-        let titre = d["titre"].as_str().or_else(|| d["title"].as_str()).unwrap_or("?");
-        let id    = d["id"].as_str().unwrap_or("");
-        lines.push(format!("- **{titre}**{}", if id.is_empty() { String::new() } else { format!(" — `{id}`") }));
+    let leg = int_arg(args, "legislature_id", 0);
+    if leg == 0 { anyhow::bail!("legislature_id est obligatoire."); }
+    let ty = { let x = str_arg(args, "type_dossier").to_uppercase(); if x.is_empty() { "LOI_PUBLIEE".to_string() } else { x } };
+    let data = client.post("/list/dossiersLegislatifs", json!({ "type": ty, "legislatureId": leg })).await?;
+    let items = data["dossiersLegislatifs"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() { return Ok(format!("Aucun dossier législatif ({ty}) pour la législature {leg}.")); }
+    let mut lines = vec![format!("**{} dossier(s) législatif(s)** — législature {leg}, {ty}\n", items.len())];
+    for d in items.iter().take(300) {
+        let dc = fmt_date(&d["dateCreation"]);
+        lines.push(format!("- **{}**{} — `{}`", { let x = s(d, "titre"); if x.is_empty() { "?" } else { x } }, if dc.is_empty() { String::new() } else { format!(" ({dc})") }, s(d, "id")));
     }
     Ok(lines.join("\n"))
 }
 
 async fn do_dossier_text(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    let body = json!({ "id": id });
-    let data = client.post("/consult/dossierLegislatif", body).await?;
-    fmt_generic_text(&data, id)
+    let id = require_any(args, &["id", "text_id"])?;
+    let data = client.post("/consult/dossierLegislatif", json!({ "id": id })).await?;
+    Ok(fmt_dossier(data.get("dossierLegislatif").unwrap_or(&data), id))
 }
 
 // ============================================================================
@@ -2082,18 +1849,31 @@ async fn do_dossier_text(args: &Value, client: &LegifranceClient) -> Result<Stri
 // ============================================================================
 
 async fn do_jade_search(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let query = require_str(args, "query")?;
-    let body  = build_search_body(args, "JADE");
-    let data  = client.post("/search", body).await?;
-    Ok(fmt_search(&data, query))
+    let mut body = json!({ "page": int_arg(args, "page", 1).max(1) });
+    let q = str_arg(args, "query");
+    if !q.is_empty() { body["libelle"] = json!(q); }
+    let id = str_arg(args, "id");
+    if !id.is_empty() { body["id"] = json!(id); }
+    let fond = str_arg(args, "fond");
+    if !fond.is_empty() { body["fond"] = json!(norm_fond(fond)?); }
+    if args["niveau"].is_number() { body["niveau"] = json!(int_arg(args, "niveau", 0)); }
+    if args["par_niveau"].as_bool().unwrap_or(false) { body["searchByNiveau"] = json!(true); }
+    if args["suggestion"].as_bool().unwrap_or(false) { body["searchSuggest"] = json!(true); }
+    let data = client.post("/consult/getJuriPlanClassement", body).await?;
+    let items = data["listPlanClassementJuri"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() { return Ok("Aucune entrée de plan de classement.".into()); }
+    let mut lines = vec![format!("**{} entrée(s) du plan de classement**\n", items.len())];
+    for it in items.iter().take(100) {
+        let lib = ["libelle", "titre", "title"].iter().map(|k| s(it, k)).find(|x| !x.is_empty()).unwrap_or("?");
+        lines.push(format!("- {lib} — `{}`", s(it, "id")));
+    }
+    Ok(lines.join("\n"))
 }
 
 async fn do_jade_text(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let id   = require_str(args, "id")?;
-    // CORRECTION vs référence : POST /consult/juri attend {textId}, pas {id}.
-    let body = json!({ "textId": id });
-    let data = client.post("/consult/juri", body).await?;
-    fmt_generic_text(&data, id)
+    let id = require_any(args, &["id", "text_id"])?;
+    let data = client.post("/consult/juri", json!({ "textId": id })).await?;
+    Ok(fmt_texte_simple(data.get("text").unwrap_or(&data), id))
 }
 
 // ============================================================================
@@ -2115,8 +1895,9 @@ async fn do_consult_jorf_date(args: &Value, client: &LegifranceClient) -> Result
     }
 
     let mut body = json!({
-        "pageNumber": 1,
-        "pageSize": int_arg(args, "nb_resultats", 20),
+        "pageNumber": int_arg(args, "page", 1).max(1),
+        "pageSize": int_arg(args, "nb_resultats", 20).clamp(1, 100),
+        "highlightActivated": false,
     });
     if !jorf_id.is_empty() {
         body["id"] = json!(jorf_id);
@@ -2153,103 +1934,6 @@ fn date_parts(date: &str) -> Value {
 /// (l'API Légifrance type ses champs date en date-time, pas en simple date).
 fn to_iso_datetime(date: &str) -> String {
     if date.contains('T') { date.to_string() } else { format!("{date}T00:00:00Z") }
-}
-
-fn fmt_section_result(data: &Value, id: &str) -> Result<String> {
-    let titre = data["titre"].as_str().or_else(|| data["title"].as_str()).unwrap_or(id);
-    let mut lines = vec![format!("## {titre}\n")];
-    let articles = data["articles"].as_array().cloned().unwrap_or_default();
-    if articles.is_empty() {
-        lines.push(fmt_toc(data, titre));
-    } else {
-        for a in &articles {
-            lines.push(fmt_article(a));
-            lines.push(String::new());
-        }
-    }
-    Ok(lines.join("\n"))
-}
-
-fn fmt_versions(data: &Value, id: &str) -> Result<String> {
-    let versions = data["versions"].as_array()
-        .or_else(|| data.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if versions.is_empty() { return Ok(format!("Aucune version trouvée pour `{id}`.")); }
-    let mut lines = vec![format!("**{} version(s) de `{id}`**\n", versions.len())];
-    for (i, v) in versions.iter().enumerate() {
-        let debut = fmt_date(&v["dateDebut"]);
-        let fin   = fmt_date(&v["dateFin"]);
-        let etat  = v["etat"].as_str().unwrap_or("");
-        let vid   = v["id"].as_str().unwrap_or("");
-        let range = match (debut.is_empty(), fin.is_empty()) {
-            (false, false) => format!("{debut} → {fin}"),
-            (false, true)  => format!("{debut} → en vigueur"),
-            _              => String::new(),
-        };
-        lines.push(format!("{}. {range} — *{etat}* — `{vid}`", i + 1));
-    }
-    Ok(lines.join("\n"))
-}
-
-fn fmt_liens(data: &Value, id: &str) -> Result<String> {
-    let liens = data["links"].as_array()
-        .or_else(|| data["liens"].as_array())
-        .cloned()
-        .unwrap_or_default();
-    if liens.is_empty() { return Ok(format!("Aucun lien trouvé pour `{id}`.")); }
-    let mut lines = vec![format!("**{} lien(s) pour `{id}`**\n", liens.len())];
-    for l in liens.iter().take(50) {
-        let ltype   = l["typeLink"].as_str().or_else(|| l["typeLien"].as_str()).unwrap_or("");
-        let titre   = l["title"].as_str().or_else(|| l["titre"].as_str()).unwrap_or("");
-        let lid     = l["id"].as_str().unwrap_or("");
-        let num     = l["num"].as_str().unwrap_or("");
-        let label   = if !titre.is_empty() { titre } else { num };
-        lines.push(format!("- [{ltype}] {label} — `{lid}`"));
-    }
-    if liens.len() > 50 { lines.push(format!("*… {} liens supplémentaires*", liens.len() - 50)); }
-    Ok(lines.join("\n"))
-}
-
-fn fmt_jorf_text_result(data: &Value, id: &str) -> Result<String> {
-    let titre = data["titre"].as_str()
-        .or_else(|| data["title"].as_str())
-        .or_else(|| data["titreTxt"].as_str())
-        .unwrap_or(id);
-    let nature = data["nature"].as_str().unwrap_or("");
-    let date_pub = fmt_date(&data["datePublication"]);
-    let date_sig = fmt_date(&data["dateSignature"]);
-    let jorf_num = data["numJO"].as_str().or_else(|| data["numParution"].as_str()).unwrap_or("");
-
-    let mut lines = vec![format!("# {titre}\n")];
-    if !nature.is_empty()   { lines.push(format!("**Nature** : {nature}")); }
-    if !date_pub.is_empty() { lines.push(format!("**Date de publication** : {date_pub}")); }
-    if !date_sig.is_empty() { lines.push(format!("**Date de signature** : {date_sig}")); }
-    if !jorf_num.is_empty() { lines.push(format!("**Numéro JORF** : {jorf_num}")); }
-    lines.push(format!("**ID** : `{id}`\n"));
-
-    // Articles dans le texte
-    let articles = data["articles"].as_array().cloned().unwrap_or_default();
-    if !articles.is_empty() {
-        lines.push(format!("\n**{} article(s)**\n", articles.len()));
-        for a in articles.iter().take(10) {
-            lines.push(fmt_article(a));
-            lines.push(String::new());
-        }
-        if articles.len() > 10 {
-            lines.push(format!("*… {} article(s) supplémentaire(s)*", articles.len() - 10));
-        }
-    } else {
-        // Essayer le contenu brut
-        let raw = data["texte"].as_str().or_else(|| data["content"].as_str()).unwrap_or("");
-        if !raw.is_empty() {
-            let texte = strip_html(raw);
-            let excerpt = if texte.len() > 4000 { &texte[..4000] } else { &texte };
-            lines.push(format!("\n{excerpt}"));
-            if texte.len() > 4000 { lines.push("*[Texte tronqué]*".into()); }
-        }
-    }
-    Ok(lines.join("\n"))
 }
 
 fn fmt_jo_list(data: &Value) -> Result<String> {
@@ -2331,35 +2015,174 @@ fn collect_liens_txt(tms: &[Value], out: &mut Vec<String>, depth: usize) {
     }
 }
 
-fn fmt_generic_text(data: &Value, id: &str) -> Result<String> {
-    // Essayer plusieurs structures possibles
-    if let Some(article) = data.get("article") {
-        if !article.is_null() { return Ok(fmt_article(article)); }
+// ============================================================================
+// Aides communes (v2)
+// ============================================================================
+
+/// Premier argument non vide parmi plusieurs noms (alias).
+fn arg_any<'a>(args: &'a Value, keys: &[&str]) -> &'a str {
+    for k in keys {
+        if let Some(v) = args[*k].as_str() { if !v.trim().is_empty() { return v.trim(); } }
     }
-    let titre = data["titre"].as_str()
-        .or_else(|| data["title"].as_str())
-        .or_else(|| data["titreTxt"].as_str())
-        .unwrap_or(id);
-    let raw = data["texteHtml"].as_str()
-        .or_else(|| data["texte"].as_str())
-        .or_else(|| data["content"].as_str())
-        .or_else(|| data["texteIntegral"].as_str())
-        .unwrap_or("");
-    let texte = strip_html(raw);
-    let mut lines = vec![format!("# {titre}\n")];
-    let date_pub = fmt_date(&data["datePublication"]);
-    let date_sig = fmt_date(&data["dateSignature"]);
-    let nature   = data["nature"].as_str().unwrap_or("");
-    if !nature.is_empty()   { lines.push(format!("**Nature** : {nature}")); }
-    if !date_pub.is_empty() { lines.push(format!("**Date de publication** : {date_pub}")); }
-    if !date_sig.is_empty() { lines.push(format!("**Date de signature** : {date_sig}")); }
-    lines.push(format!("**ID** : `{id}`\n"));
-    if !texte.is_empty() {
-        let excerpt = if texte.len() > 6000 { &texte[..6000] } else { &texte };
-        lines.push(excerpt.to_string());
-        if texte.len() > 6000 { lines.push("\n*[Texte tronqué à 6000 caractères]*".into()); }
-    } else if let Some(sections) = data["sections"].as_array() {
-        if !sections.is_empty() { lines.push(fmt_toc(data, titre)); }
+    ""
+}
+fn require_any<'a>(args: &'a Value, keys: &[&str]) -> Result<&'a str> {
+    let v = arg_any(args, keys);
+    if v.is_empty() { anyhow::bail!("Paramètre '{}' obligatoire.", keys[0]); }
+    Ok(v)
+}
+fn list_body(args: &Value, default_size: i64) -> Value {
+    json!({
+        "pageNumber": int_arg(args, "page", 1).max(1),
+        "pageSize":   int_arg(args, "nb_resultats", default_size).clamp(1, 100),
+    })
+}
+fn mk(name: &str, description: &str, schema: Value) -> ToolDef {
+    ToolDef { name: name.into(), description: description.into(), input_schema: schema }
+}
+fn total_of(data: &Value, n: usize) -> i64 { data["totalResultNumber"].as_i64().unwrap_or(n as i64) }
+
+/// Résolution d'un code : table statique, sinon interrogation de /list/code.
+async fn resolve_code_dyn(client: &LegifranceClient, code: &str) -> Result<String> {
+    if let Ok(id) = resolve_code(code) { return Ok(id); }
+    let body = json!({ "pageNumber": 1, "pageSize": 20, "codeName": code.trim(), "states": ["VIGUEUR"], "sort": "TITLE_ASC" });
+    let data = client.post("/list/code", body).await?;
+    let res = data["results"].as_array().cloned().unwrap_or_default();
+    let q = code.trim().to_lowercase();
+    let exact: Vec<&Value> = res.iter().filter(|r| s(r, "titre").to_lowercase() == q).collect();
+    let cand: Vec<&Value> = if exact.len() == 1 { exact } else { res.iter().collect() };
+    let id_of = |r: &Value| { let c = s(r, "cid"); (if c.is_empty() { s(r, "id") } else { c }).to_string() };
+    match cand.len() {
+        0 => anyhow::bail!("Aucun code ne correspond à '{code}'. Utilisez legifrance_lister_codes."),
+        1 => Ok(id_of(cand[0])),
+        _ => {
+            let l: Vec<String> = cand.iter().take(8).map(|r| format!("{} ({})", s(r, "titre"), id_of(r))).collect();
+            anyhow::bail!("'{code}' est ambigu. Précisez ou passez l'ID LEGITEXT : {}", l.join(" ; "))
+        }
+    }
+}
+
+/// « L. 1234-1 », « Article L1234-1 », « art. 1382 » → forme attendue par l'API (« L1234-1 », « 1382 »).
+fn normalize_article_num(n: &str) -> String {
+    let mut t = n.trim().replace('\u{a0}', " ");
+    let low = t.to_lowercase();
+    for p in ["article ", "art. ", "art "] {
+        if low.starts_with(p) { if let Some(r) = t.get(p.len()..) { t = r.trim().to_string(); } break; }
+    }
+    let cs: Vec<char> = t.chars().collect();
+    if cs.len() > 2 && cs[0].is_ascii_uppercase() && (cs[1] == '.' || cs[1] == ' ') {
+        let rest: String = cs[2..].iter().collect::<String>().trim_start().to_string();
+        if rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            return format!("{}{}", cs[0], rest);
+        }
+    }
+    t
+}
+
+/// Version d'un article en vigueur à `date`, via Article.articleVersions.
+async fn article_at_date(client: &LegifranceClient, article: &Value, date: &str) -> Result<Value> {
+    let Some(ms) = ymd_to_ms(date) else { anyhow::bail!("Date invalide '{date}' (format YYYY-MM-DD).") };
+    if date == today() { return Ok(article.clone()); }
+    let cur_id = s(article, "id");
+    if let Some(vs) = article["articleVersions"].as_array() {
+        for v in vs {
+            let d = value_to_ms(&v["dateDebut"]).unwrap_or(i64::MAX);
+            let f = value_to_ms(&v["dateFin"]).unwrap_or(i64::MAX);
+            if d <= ms && ms <= f {
+                let id = s(v, "id");
+                if id.is_empty() || id == cur_id { return Ok(article.clone()); }
+                let data = client.post("/consult/getArticle", json!({ "id": id })).await?;
+                return Ok(data["article"].clone());
+            }
+        }
+    }
+    anyhow::bail!("Aucune version de cet article n'était en vigueur au {date} (voir legifrance_versions_article).")
+}
+
+fn flatten_results(data: &Value) -> Vec<(String, Value)> {
+    match &data["results"] {
+        Value::Object(m) => m.iter().flat_map(|(k, v)| v.as_array().cloned().unwrap_or_default().into_iter().map(move |x| (k.clone(), x))).collect(),
+        Value::Array(a) => a.iter().map(|x| (String::new(), x.clone())).collect(),
+        _ => vec![],
+    }
+}
+
+fn fmt_suggest(data: &Value, query: &str, what: &str) -> String {
+    let items = flatten_results(data);
+    if items.is_empty() { return format!("Aucune suggestion {what} pour : « {query} »"); }
+    let mut lines = vec![format!("**Suggestions {what} pour « {query} »**\n")];
+    for (grp, r) in items.iter().take(30) {
+        let title = ["title", "titre", "label", "libelle", "name", "raisonSociale", "rs"].iter().map(|k| s(r, k)).find(|x| !x.is_empty()).unwrap_or("");
+        let title = if title.is_empty() { r.to_string() } else { title.to_string() };
+        let id = ["id", "cid", "idText", "textId"].iter().map(|k| s(r, k)).find(|x| !x.is_empty()).unwrap_or("");
+        let siret = s(r, "siret");
+        let mut l = format!("- {title}");
+        if !siret.is_empty() { l.push_str(&format!(" — SIRET {siret}")); }
+        if !id.is_empty() { l.push_str(&format!(" — `{id}`")); }
+        if !grp.is_empty() { l.push_str(&format!(" [{grp}]")); }
+        lines.push(l);
+    }
+    lines.join("\n")
+}
+
+fn tool_ping() -> ToolDef {
+    mk("legifrance_ping",
+       "Vérifie la disponibilité des 5 contrôleurs de l'API Légifrance (chrono, consult, list, search, suggest) et l'authentification PISTE.",
+       json!({ "type": "object", "properties": {} }))
+}
+async fn do_ping(client: &LegifranceClient) -> Result<String> {
+    let mut lines = vec!["**État de l'API Légifrance**\n".to_string()];
+    for c in ["chrono", "consult", "list", "search", "suggest"] {
+        match client.get(&format!("/{c}/ping")).await {
+            Ok(v) => lines.push(format!("- ✅ `/{c}/ping` : {}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))),
+            Err(e) => lines.push(format!("- ❌ `/{c}/ping` : {e}")),
+        }
     }
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tris_par_fond() {
+        assert_eq!(sort_for_fond("JORF", "DATE_DESC"), "SIGNATURE_DATE_DESC");
+        assert_eq!(sort_for_fond("CETAT", "DATE_ASC"), "DATE_ASC");
+        assert_eq!(sort_for_fond("CNIL", "DATE_DESC"), "DATE_DECISION_DESC");
+        assert_eq!(sort_for_fond("ALL", "DATE_DESC"), "PERTINENCE");
+        assert_eq!(sort_for_fond("CODE_DATE", ""), "PERTINENCE");
+        assert_eq!(sort_for_fond("JORF", "SIGNATURE_DATE_ASC"), "SIGNATURE_DATE_ASC");
+    }
+    #[test]
+    fn fonds_valides_et_alias() {
+        assert_eq!(norm_fond("jade").unwrap(), "CETAT");
+        assert_eq!(norm_fond("").unwrap(), "ALL");
+        assert_eq!(norm_fond("code").unwrap(), "CODE_DATE");
+        assert!(norm_fond("DOSSIER_LEGISLATIF").is_err());
+    }
+    #[test]
+    fn numero_article() {
+        assert_eq!(normalize_article_num("L. 1234-1"), "L1234-1");
+        assert_eq!(normalize_article_num("Article R123-4"), "R123-4");
+        assert_eq!(normalize_article_num("art. 1382"), "1382");
+        assert_eq!(normalize_article_num("6 nonies"), "6 nonies");
+    }
+    #[test]
+    fn corps_de_recherche_code() {
+        let b = build_search_body(&json!({"query":"bail","code":"civil","date_debut":"2020-05-01"}), "ALL").unwrap();
+        assert_eq!(b["fond"], "CODE_DATE");
+        let f = &b["recherche"]["filtres"];
+        assert_eq!(f[0], json!({"facette":"NOM_CODE","valeurs":["Code civil"]}));
+        assert_eq!(f[1], json!({"facette":"DATE_VERSION","singleDate":"2020-05-01"}));
+        assert_eq!(b["recherche"]["sort"], "PERTINENCE");
+    }
+    #[test]
+    fn corps_de_recherche_jorf() {
+        let b = build_search_body(&json!({"query":"x","fond":"JORF","tri":"DATE_DESC","nature":"loi","date_debut":"2020-01-01"}), "ALL").unwrap();
+        let r = &b["recherche"];
+        assert_eq!(r["sort"], "SIGNATURE_DATE_DESC");
+        assert_eq!(r["filtres"][0], json!({"facette":"DATE_SIGNATURE","dates":{"start":"2020-01-01"}}));
+        assert_eq!(r["filtres"][1], json!({"facette":"NATURE","valeurs":["LOI"]}));
+    }
 }

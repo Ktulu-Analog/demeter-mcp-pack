@@ -29,7 +29,7 @@ Lecture et écriture d'un espace [Grist](https://www.getgrist.com/) (tableur col
 
 ![Capture d'écran mcp-legifrance](docs/mcp-legifrance.png)
 
-Codes et textes en vigueur et leurs articles (avec versions et liens de concordance), lois et règlements (LODA), Journal Officiel (derniers numéros, sommaires par date), conventions collectives (KALI), jurisprudence administrative et judiciaire, délibérations CNIL, accords d'entreprise, dossiers et débats parlementaires. **62 outils**, via l'API Légifrance (PISTE).
+Codes et textes en vigueur et leurs articles (avec versions et liens de concordance), lois et règlements (LODA), Journal Officiel (derniers numéros, sommaires par date), conventions collectives (KALI), jurisprudence administrative et judiciaire, délibérations CNIL, accords d'entreprise, dossiers et débats parlementaires. **63 outils**, via l'API Légifrance (PISTE).
 
 ### `mcp-system`
 
