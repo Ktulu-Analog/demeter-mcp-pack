@@ -1037,11 +1037,14 @@ fn tool_dates_sans_jo() -> ToolDef {
         }),
     }
 }
-async fn do_dates_sans_jo(_args: &Value, client: &LegifranceClient) -> Result<String> {
+async fn do_dates_sans_jo(args: &Value, client: &LegifranceClient) -> Result<String> {
     let data = client.get("/misc/datesWithoutJo").await?;
     let dates = data["lstDateDisabled"].as_array().cloned().unwrap_or_default();
     if dates.is_empty() { return Ok("Aucune date sans JO retournée.".into()); }
-    let list: Vec<String> = dates.iter().map(fmt_date).filter(|d| !d.is_empty()).collect();
+    let annee = int_arg(args, "annee", 0);
+    let list: Vec<String> = dates.iter().map(fmt_date)
+        .filter(|d| !d.is_empty() && (annee == 0 || d.starts_with(&annee.to_string()))).collect();
+    if list.is_empty() { return Ok(format!("Aucune date sans JO en {annee}.")); }
     Ok(format!("**{} date(s) sans Journal Officiel**\n\n{}", list.len(), list.join(", ")))
 }
 
@@ -1104,7 +1107,7 @@ fn tool_convention_cont() -> ToolDef {
     ToolDef {
         name: "legifrance_convention_cont".into(),
         description: "Consulte le conteneur d'une convention collective par son identifiant KALI (KALICONT...).".into(),
-        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant KALICONT..." }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" } } }),
+        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant KALICONT..." } } }),
     }
 }
 fn tool_convention_texte() -> ToolDef {
@@ -1129,14 +1132,14 @@ fn tool_convention_article() -> ToolDef {
     ToolDef {
         name: "legifrance_convention_article".into(),
         description: "Consulte un article spécifique d'une convention collective par son identifiant KALI (KALIARTI...).".into(),
-        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant KALIARTI..." }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" } } }),
+        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant KALIARTI..." } } }),
     }
 }
 fn tool_convention_section() -> ToolDef {
     ToolDef {
         name: "legifrance_convention_section".into(),
         description: "Consulte une section d'une convention collective par son identifiant KALI (KALISECT...).".into(),
-        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant KALISECT..." }, "date": { "type": "string", "description": "Date de vigueur YYYY-MM-DD" } } }),
+        input_schema: json!({ "type": "object", "required": ["id"], "properties": { "id": { "type": "string", "description": "Identifiant KALISECT..." } } }),
     }
 }
 fn tool_jurisprudence() -> ToolDef {
@@ -1645,21 +1648,28 @@ async fn do_code_article_liens(args: &Value, client: &LegifranceClient) -> Resul
     Ok(fmt_revision_links(&data, id, "Liens de concordance"))
 }
 
-async fn do_code_list(_args: &Value, client: &LegifranceClient) -> Result<String> {
-    let body = json!({ "pageNumber": 1, "pageSize": 200 });
-    let data = client.post("/list/code", body).await?;
-    let results = data["results"].as_array()
-        .or_else(|| data.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if results.is_empty() { return Ok("Aucun code trouvé.".into()); }
-    let mut lines = vec![format!("**{} code(s) disponibles**\n", results.len())];
-    for r in &results {
-        let title = r["title"].as_str().or_else(|| r["titre"].as_str()).unwrap_or("");
-        let id    = r["id"].as_str().or_else(|| r["cid"].as_str()).unwrap_or("");
-        let short = r["shortTitle"].as_str().unwrap_or("");
-        let label = if !short.is_empty() { short } else { title };
-        lines.push(format!("- **{label}** — `{id}`"));
+async fn do_code_list(args: &Value, client: &LegifranceClient) -> Result<String> {
+    // CodeListRequest : pageSize ≤ 100 → on pagine ; états et nom filtrés côté API.
+    let only_force = args["en_vigueur_seulement"].as_bool().unwrap_or(true);
+    let filtre = str_arg(args, "filtre").trim().to_string();
+    let mut all: Vec<Value> = Vec::new();
+    for page in 1..=10 {
+        let mut body = json!({ "pageNumber": page, "pageSize": 100, "sort": "TITLE_ASC" });
+        if only_force { body["states"] = json!(["VIGUEUR"]); }
+        if !filtre.is_empty() { body["codeName"] = json!(filtre); }
+        let data = client.post("/list/code", body).await?;
+        let results = data["results"].as_array().cloned().unwrap_or_default();
+        let n = results.len();
+        all.extend(results);
+        let total = data["totalResultNumber"].as_i64().unwrap_or(0) as usize;
+        if n < 100 || (total > 0 && all.len() >= total) { break; }
+    }
+    if all.is_empty() { return Ok("Aucun code trouvé.".into()); }
+    let mut lines = vec![format!("**{} code(s)**\n", all.len())];
+    for r in &all {
+        let id = { let c = s(r, "cid"); if c.is_empty() { s(r, "id") } else { c } };
+        let etat = s(r, "etat");
+        lines.push(format!("- **{}** — `{id}`{}", s(r, "titre"), if etat.is_empty() { String::new() } else { format!(" [{etat}]") }));
     }
     Ok(lines.join("\n"))
 }
@@ -1735,7 +1745,7 @@ async fn do_jorf_section(args: &Value, client: &LegifranceClient) -> Result<Stri
 }
 
 async fn do_jorf_jo_list(args: &Value, client: &LegifranceClient) -> Result<String> {
-    let n = int_arg(args, "nb_elements", int_arg(args, "nb", 10)).clamp(1, 2499);
+    let n = int_arg(args, "taille", int_arg(args, "nb_elements", 10)).clamp(1, 2499);
     let data = client.post("/consult/lastNJo", json!({ "nbElement": n })).await?;
     fmt_jo_list(&data)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "mcp-legifrance"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Serveur MCP HTTP Streamable pour l'API Légifrance (PISTE) — écrit en Rust"
 license = "AGPL-3.0"

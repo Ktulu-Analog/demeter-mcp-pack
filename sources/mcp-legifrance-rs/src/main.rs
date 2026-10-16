@@ -345,10 +345,9 @@ async fn process_request(val: Value, state: &AppState) -> JsonRpcResponse {
         "tools/list" => {
             let tools: Vec<Value> = state.tools.iter().map(|tool| {
                 let mut v = serde_json::to_value(tool).unwrap_or(Value::Null);
-                v["annotations"] = json!({
-                    "readOnlyHint": true, "destructiveHint": false,
-                    "idempotentHint": true, "openWorldHint": true
-                });
+                // Minimal (≈ 6 jetons/outil) : readOnlyHint suffit, les autres indices
+                // sont sans objet pour un outil en lecture seule.
+                v["annotations"] = json!({ "readOnlyHint": true });
                 v
             }).collect();
             JsonRpcResponse::ok(id, json!({ "tools": tools }))

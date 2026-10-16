@@ -7,9 +7,30 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/).
 
 ---
 
+## [0.3.3] — 2026-10-16
+
+`mcp-legifrance` 0.2.2. Corrections de paramètres déclarés dans le schéma des outils mais ignorés par le code, repérées en comparant chaque schéma au code de son outil.
+
+### Corrigé
+
+- `legifrance_lister_codes` : `filtre` et `en_vigueur_seulement` étaient toujours ignorés. Ce correctif figurait dans la 0.3.2 mais n'y était pas appliqué ; il l'est désormais. Les paramètres sont transmis à `/list/code` (`codeName`, `states`), la liste est paginée par pages de 100 (maximum de l'API — l'ancien `pageSize` de 200 le dépassait) et lue avec les bons champs (`titre`, `cid`, `etat`).
+- `legifrance_derniers_jo` : `taille` était ignoré (toujours 10 JO) ; il est lu et borné entre 1 et 2 499.
+- `legifrance_dates_sans_jo` : `annee` était ignoré ; il filtre désormais les dates retournées.
+- `legifrance_convention_cont`, `legifrance_convention_article`, `legifrance_convention_section` : le paramètre `date`, déclaré mais jamais utilisé (aucun équivalent dans l'API), est retiré du schéma.
+
+### Modifié
+
+- Annotations des outils réduites à `readOnlyHint: true` (au lieu de quatre indices) : environ 1 500 jetons de moins par requête quand les 63 outils sont exposés au LLM, sans perte d'information pour un outil en lecture seule.
+
+### Vérifié
+
+- Harnais de conformité (63 outils, requêtes validées contre le swagger) : 0 écart ; 11 tests unitaires ; build sans avertissement.
+
+---
+
 ## [0.3.2] — 2026-10-15
 
-Audit de conformité de `mcp-legifrance` (passage en v0.2.1) contre le swagger Légifrance : **67 des 68 opérations** sont désormais couvertes (la 68ᵉ, `/consult/code/tableMatieres`, est dépréciée et remplacée par `/consult/legi/tableMatieres`).
+Audit de conformité de `mcp-legifrance` (v0.2.0) contre le swagger Légifrance : **67 des 68 opérations** sont désormais couvertes (la 68ᵉ, `/consult/code/tableMatieres`, est dépréciée et remplacée par `/consult/legi/tableMatieres`). Chaque outil a été exécuté contre un faux serveur validant requêtes et schémas du swagger : 0 écart.
 
 ### Corrigé — requêtes invalides (HTTP 400/404)
 
