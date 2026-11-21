@@ -5,6 +5,15 @@
 // ============================================================================
 use serde_json::Value;
 
+/// Truncate to at most `max` characters without splitting a UTF-8 sequence.
+fn truncate_chars(s: &str, max: usize) -> (String, bool) {
+    if s.chars().count() <= max {
+        (s.to_string(), false)
+    } else {
+        (s.chars().take(max).collect(), true)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Résumé court (une décision)
 // ---------------------------------------------------------------------------
@@ -52,12 +61,8 @@ pub fn fmt_decision_short(d: &Value) -> String {
 
     // Sommaire
     if !summary.is_empty() {
-        let truncated = if summary.len() > 300 {
-            format!("{}…", &summary[..300])
-        } else {
-            summary.to_string()
-        };
-        lines.push(format!("  {truncated}"));
+        let (truncated, cut) = truncate_chars(summary, 300);
+        lines.push(format!("  {truncated}{}", if cut { "…" } else { "" }));
     }
 
     lines.join("\n")
@@ -109,10 +114,10 @@ pub fn fmt_decision_full(d: &Value) -> String {
         .or_else(|| d["text_highlight"].as_str())
         .unwrap_or("");
     if !text.is_empty() {
-        let total_len = text.len();
-        let excerpt = if total_len > 6000 { &text[..6000] } else { text };
+        let total_len = text.chars().count();
+        let (excerpt, cut) = truncate_chars(text, 6000);
         lines.push(format!("\n**Texte intégral** :\n\n{excerpt}"));
-        if total_len > 6000 {
+        if cut {
             lines.push(format!(
                 "\n*[Texte tronqué — {total_len} caractères au total. \
                  Consultez judilibre.fr pour le texte intégral]*"
@@ -121,4 +126,36 @@ pub fn fmt_decision_full(d: &Value) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn truncate_chars_never_splits_utf8() {
+        let s = "é".repeat(400);
+        let (out, cut) = truncate_chars(&s, 300);
+        assert!(cut);
+        assert_eq!(out.chars().count(), 300);
+        assert_eq!(out, "é".repeat(300));
+    }
+
+    #[test]
+    fn decision_short_handles_accented_summary() {
+        let d = json!({"summary": "é".repeat(400)});
+        let out = fmt_decision_short(&d);
+        let expected = "é".repeat(300);
+        assert!(out.contains(&expected));
+        assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn decision_full_handles_accented_text() {
+        let d = json!({"text": "é".repeat(6001)});
+        let out = fmt_decision_full(&d);
+        assert!(out.contains("Texte tronqué"));
+        assert!(out.contains(&"é".repeat(6000)));
+    }
 }
