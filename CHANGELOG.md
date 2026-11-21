@@ -13,10 +13,6 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/).
 
 - `mcp-judilibre` : la troncature du sommaire (300) et du texte intégral (6000) coupait au milieu d'un caractère UTF-8 et paniquait sur les accents. Elle compte désormais des caractères et ne peut plus couper une séquence UTF-8.
 
-### Ajouté
-
-- `mcp-judilibre` : `JUDILIBRE_ENV=sandbox` bascule sur les endpoints PISTE de test (`sandbox-api.piste.gouv.fr` / `sandbox-oauth.piste.gouv.fr`), comme `LEGIFRANCE_ENV` pour `mcp-legifrance`. Défaut : production.
-
 ---
 
 ## [0.3.3] — 2026-10-16
