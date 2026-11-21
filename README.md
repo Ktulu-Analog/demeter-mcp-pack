@@ -19,6 +19,8 @@
 
 Donne accès à la base de jurisprudence judiciaire ouverte de la Cour de cassation via l'API [JUDILIBRE](https://www.judilibre.io/) (PISTE) : recherche plein texte paginée, récupération d'une décision complète par identifiant, export en masse, taxonomie des champs/filtres, statistiques, historique transactionnel. **8 outils**. Portage Rust d'un projet Python original — binaire unique, sans dépendance runtime.
 
+Variables d'environnement : `JUDILIBRE_CLIENT_ID`, `JUDILIBRE_CLIENT_SECRET` (identifiants OAuth de l'application PISTE) et `JUDILIBRE_ENV` (`production` par défaut, `sandbox` pour l'environnement de test) — même convention que `LEGIFRANCE_ENV`.
+
 ### `mcp-grist`
 
 ![Capture d'écran mcp-grist](docs/mcp-grist.png)

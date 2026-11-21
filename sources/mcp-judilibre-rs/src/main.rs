@@ -115,6 +115,17 @@ async fn main() {
         info!("✅ Credentials JUDILIBRE détectés.");
     }
 
+    let env_label = if std::env::var("JUDILIBRE_ENV").as_deref() == Ok("sandbox") {
+        "SANDBOX"
+    } else {
+        "PRODUCTION"
+    };
+    info!(
+        "🌐 Environnement PISTE : {} ({}) — pour basculer, définissez JUDILIBRE_ENV=sandbox",
+        env_label,
+        client::base_url()
+    );
+
     let state = AppState {
         client: Arc::new(JudiLibreClient::new(client_id, client_secret)),
         tools: Arc::new(all_tools()),

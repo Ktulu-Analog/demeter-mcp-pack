@@ -9,6 +9,7 @@
   "args": ["--transport", "stdio"],
   "params": [
     { "key": "JUDILIBRE_CLIENT_ID", "label": "Client ID PISTE", "required": false, "help": "Identifiants obtenus sur https://piste.gouv.fr (application JUDILIBRE). Sans eux, le serveur démarre quand même mais affiche un avertissement et les outils retourneront une erreur." },
-    { "key": "JUDILIBRE_CLIENT_SECRET", "label": "Client Secret PISTE", "required": false, "secret": true }
+    { "key": "JUDILIBRE_CLIENT_SECRET", "label": "Client Secret PISTE", "required": false, "secret": true },
+    { "key": "JUDILIBRE_ENV", "label": "Environnement PISTE", "required": false, "default": "production", "help": "Mettre \"sandbox\" pour basculer sur l'environnement de test PISTE." }
   ]
 }
