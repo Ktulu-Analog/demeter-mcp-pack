@@ -10,7 +10,36 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
 
 pub const BASE_URL: &str = "https://api.piste.gouv.fr/cassation/judilibre/v1.0";
+pub const BASE_URL_SANDBOX: &str = "https://sandbox-api.piste.gouv.fr/cassation/judilibre/v1.0";
 const OAUTH_URL: &str = "https://oauth.piste.gouv.fr/api/oauth/token";
+const OAUTH_URL_SANDBOX: &str = "https://sandbox-oauth.piste.gouv.fr/api/oauth/token";
+
+/// `JUDILIBRE_ENV=sandbox` selects the PISTE sandbox endpoints; anything else
+/// (including unset) keeps production. Mirrors `LEGIFRANCE_ENV` in
+/// `mcp-legifrance`.
+fn base_url_for(env: Option<&str>) -> &'static str {
+    if env == Some("sandbox") {
+        BASE_URL_SANDBOX
+    } else {
+        BASE_URL
+    }
+}
+
+fn oauth_url_for(env: Option<&str>) -> &'static str {
+    if env == Some("sandbox") {
+        OAUTH_URL_SANDBOX
+    } else {
+        OAUTH_URL
+    }
+}
+
+pub fn base_url() -> &'static str {
+    base_url_for(std::env::var("JUDILIBRE_ENV").ok().as_deref())
+}
+
+fn oauth_url() -> &'static str {
+    oauth_url_for(std::env::var("JUDILIBRE_ENV").ok().as_deref())
+}
 
 // ---------------------------------------------------------------------------
 // Token cache
@@ -81,7 +110,7 @@ impl JudiLibreClient {
         }
 
         let resp = self.agent
-            .post(OAUTH_URL)
+            .post(oauth_url())
             .send_form(&[
                 ("grant_type",    "client_credentials"),
                 ("client_id",     &self.client_id),
@@ -107,7 +136,7 @@ impl JudiLibreClient {
         path: &str,
         params: &HashMap<String, Vec<String>>,
     ) -> Result<Value> {
-        let url = format!("{BASE_URL}{path}");
+        let url = format!("{}{path}", base_url());
 
         for attempt in 0u32..3 {
             let token = self.get_token_sync()?;
@@ -194,4 +223,23 @@ fn urlenc(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_env_selects_sandbox_endpoints() {
+        assert_eq!(base_url_for(Some("sandbox")), BASE_URL_SANDBOX);
+        assert_eq!(oauth_url_for(Some("sandbox")), OAUTH_URL_SANDBOX);
+    }
+
+    #[test]
+    fn production_is_the_default() {
+        for env in [None, Some("production"), Some(""), Some("SANDBOX")] {
+            assert_eq!(base_url_for(env), BASE_URL);
+            assert_eq!(oauth_url_for(env), OAUTH_URL);
+        }
+    }
 }

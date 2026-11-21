@@ -7,6 +7,14 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/).
 
 ---
 
+## [Unreleased]
+
+### Ajouté
+
+- `mcp-judilibre` : `JUDILIBRE_ENV=sandbox` bascule sur les endpoints PISTE de test (`sandbox-api.piste.gouv.fr` / `sandbox-oauth.piste.gouv.fr`), comme `LEGIFRANCE_ENV` pour `mcp-legifrance`. Défaut : production.
+
+---
+
 ## [0.3.3] — 2026-10-16
 
 `mcp-legifrance` 0.2.2. Corrections de paramètres déclarés dans le schéma des outils mais ignorés par le code, repérées en comparant chaque schéma au code de son outil.
